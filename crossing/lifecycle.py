@@ -1,4 +1,4 @@
-"""quote / authorize / reserve_and_commit / execute / finalize_success | finalize_release."""
+"""quote / authorize / reserve_and_commit / mark_executing / execute / finalize_success | finalize_release."""
 
 from __future__ import annotations
 
@@ -248,7 +248,20 @@ def invoke(
             task_id=task_id,
         )
 
-    # External execute is outside the reserve transaction (already committed).
+    # Durable dispatch: reserved → executing COMMITTED before any provider I/O.
+    marked = ledger.mark_executing(session, invocation)
+    if not marked.won:
+        return InvokeResult(
+            ok=False,
+            reason=marked.reason or Reason.IN_PROGRESS,
+            detail=f"dispatch not started; status={invocation.status}",
+            amount_cents=price,
+            remaining_cents=session.get(type(mandate), mandate.id).remaining_cents if mandate else None,
+            reservation_id=reservation.id,
+            idempotency_key=idempotency_key,
+            task_id=task_id,
+        )
+
     try:
         tool_result = mock_mcp.call_tool(
             tool,
@@ -256,15 +269,9 @@ def invoke(
             invocation_id=invocation.id,
             idempotency_key=idempotency_key,
         )
-    except Exception as exc:  # MCP failure: terminal release owns refund + claim
-        invocation.status = "executed_fail"
-        session.flush()
-        ledger.finalize_release(
-            session,
-            invocation,
-            reservation,
-            allowed_statuses=("reserved", "executed_fail"),
-        )
+    except Exception as exc:
+        # Provider may have run. Do not refund or clear the claim.
+        ledger.mark_executed_fail(session, invocation)
         return InvokeResult(
             ok=False,
             reason="MCP_ERROR",
