@@ -498,6 +498,7 @@ def post_key(body: KeyIn, ctx: AuthContext = Depends(require_scope("admin"))) ->
 
 
 def _may_manage_key(ctx: AuthContext, row: ApiKey) -> None:
+    """Self may rotate/revoke own key. Sibling non-admin keys need write or admin."""
     if row is None:
         raise _closed()
     if not ctx.is_admin and row.account_id != ctx.account_id:
@@ -506,6 +507,11 @@ def _may_manage_key(ctx: AuthContext, row: ApiKey) -> None:
     admin_target = row.kind == "admin" or "admin" in scopes
     if admin_target and not ctx.is_admin and ctx.api_key_id != row.id:
         raise _forbidden("admin key rotate/revoke requires admin or the same key")
+    if ctx.api_key_id == row.id or ctx.is_admin:
+        return
+    if ctx.has_scope("write"):
+        return
+    raise _forbidden("key rotate/revoke requires self, write, or admin")
 
 
 @app.post("/v1/keys/{key_id}/rotate")
