@@ -37,13 +37,13 @@ flowchart LR
 
 Lifecycle: **quote → authorize → reserve_and_commit → mark_executing (COMMIT) → execute → finalize_success | (no auto-refund after dispatch)**.
 
-`reserve_and_commit()` treats **claim + reserve + invocation insert** as one savepoint. If the atomic debit fails (`BUDGET_EXCEEDED`), the LogicalOperation claim rolls back with it — the key is not left `in_progress` with no attempt. On success it **COMMITs** `reserved`. Then `mark_executing` CAS `reserved → executing` and **COMMITs again before any bytes to the provider**. If that CAS loses, Crossing does not call the provider. `finalize_success` accepts `executing` (and `reserved` for tests that never dispatched). Those finalize functions own the **entire** terminal unit (reservation CAS, invocation status, receipt, billing outbox, LogicalOperation claim, ledger event) in one savepoint. Losing the reservation or invocation CAS rolls the savepoint back — no receipt-then-lost-commit, no refund-then-cleared-claim. Crash after execute but before finalize leaves an `executing` (or later `executed_fail`) attempt; it does not silently roll back the reserve.
+`reserve_and_commit()` treats **claim + reserve + invocation insert** as one savepoint. If the atomic debit fails (`BUDGET_EXCEEDED`), the LogicalOperation claim rolls back with it — the key is not left `in_progress` with no attempt. On success it **COMMITs** `reserved`. Then `mark_executing` CAS `reserved → executing` and **COMMITs again before any bytes to the provider**. If that CAS loses, Crossing does not call the provider. `finalize_success` accepts `executing` (and `executed_ok` if that mid-state is used). `reserved` is not allowed: success requires the durable executing barrier. Those finalize functions own the **entire** terminal unit (reservation CAS, invocation status, receipt, billing outbox, LogicalOperation claim, ledger event) in one savepoint. Losing the reservation or invocation CAS rolls the savepoint back — no receipt-then-lost-commit, no refund-then-cleared-claim. Crash after execute but before finalize leaves an `executing` (or later `executed_fail`) attempt; it does not silently roll back the reserve.
 
 **LogicalOperation vs ExecutionAttempt:** `IdempotencyRecord` is the logical operation (unique `(principal_id, idempotency_key)`). `Invocation` is an execution attempt; the unique index on `(principal_id, idempotency_key)` was dropped so a released attempt can be retried under the same key. Completed claims still replay. An `in_progress` claim still returns `IN_PROGRESS` (wait-or-conflict) unless it was rolled back or explicitly released for retry.
 
 Scarce-authority transitions are conditional `UPDATE … RETURNING` on SQLite and Postgres: mandate debit (`remaining_cents >= cost AND revoked = 0 AND (max_calls IS NULL OR calls_used < max_calls)`), child-mandate escrow from parent remaining, and reservation `held → committed|released` CAS. CI runs a `sqlite` job and a `postgres` job. Multi-host isolation is still **not** fully solved (one primary, row-level updates — not consensus across replicas).
 
-Recovery (`ledger.recover_reserved`): `reserved` means dispatch has not been marked started, so explicit `mode="release"` may refund via `finalize_release` (reservation `held→released` and invocation `reserved→released` must both win). `executing` means side-effect is uncertain: **never auto-refund**, **never clear** the LogicalOperation. `mode="release"` on `executing` refuses. Default `mode="ambiguous"` on `reserved` or `executing` marks `ambiguous` without refund (retry stays blocked). Terminal `committed` / `released` / `ambiguous` / `executed_fail` is left alone. If the MCP call raises **after** `executing` was committed, Crossing records `executed_fail` and does **not** `finalize_release` (the vendor may have succeeded).
+Recovery (`ledger.recover_reserved`): `reserved` means dispatch has not been marked started, so explicit `mode="release"` may refund via `finalize_release` (reservation `held→released` and invocation `reserved→released` must both win). `executing` means side-effect is uncertain: **never auto-refund**, **never clear** the LogicalOperation. `mode="release"` on `executing` refuses. Default `mode="ambiguous"` on `reserved` or `executing` CAS `UPDATE … WHERE status=reserved|executing` → `ambiguous` without refund (retry stays blocked). If the CAS loses, recovery refreshes and returns whatever won. Terminal `committed` / `released` / `ambiguous` / `executed_fail` is monotonic and is never overwritten. If the MCP call raises **after** `executing` was committed, Crossing records `executed_fail` and does **not** `finalize_release` (the vendor may have succeeded).
 
 Child mandates are *attenuated*: child spend must be `> 0` and `<= parent remaining` and `<= parent spend_limit`; max_call, tools/servers subset, expiry not later than parent, `max_subagent_budget <= remaining`. Issuing a child **escrows** the child's spend cap from the parent remaining budget. Negative child spend is rejected and cannot mint parent budget.
 
@@ -125,7 +125,16 @@ Install `psycopg[binary]` (listed in `requirements.txt`) and set `DATABASE_URL=p
 
 The mandate debit, child escrow, and reservation terminal transitions are conditional updates (SQLite and Postgres). Local default is still SQLite. CI has a `postgres` job (`DATABASE_URL=postgresql+psycopg://…`). That is not multi-host consensus.
 
-## Review r7 (honest)
+## Review r8 (honest)
+
+- Transitions **to** `ambiguous` are CAS (`reserved→ambiguous` or `executing→ambiguous`). A lost CAS refreshes and returns the winner; recovery does not refund or clear the claim on the ambiguous path.
+- Terminal invocation states (`committed`, `released`, `executed_fail`, `ambiguous`) are monotonic: `recover_reserved` and `mark_executing` (still only `reserved→executing`) will not overwrite them.
+- `finalize_success` requires the durable executing barrier (`executing`, or `executed_ok` if used). Calling it on `reserved` returns `won=False` with no receipt and no reservation commit.
+- Still one global `CROSSING_API_KEY` (prototype-only).
+- Still cannot prove vendor exactly-once without provider idempotency. Crossing only guarantees at-most-one *dispatch from Crossing*.
+- Still not real-money-ready.
+
+## Review r7 (kept)
 
 - `executing` is CAS + COMMIT **before** provider I/O. Recovery will not auto-refund `executing`. A provider exception after dispatch is `executed_fail` (no refund, claim stays). `reserved` (never dispatched) is still releasable.
 - Still cannot prove vendor exactly-once without provider idempotency. Crossing only guarantees at-most-one *dispatch from Crossing*.
