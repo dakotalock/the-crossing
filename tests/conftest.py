@@ -16,12 +16,26 @@ from crossing import crypto, db
 from crossing.sdk import Crossing
 
 
+def _test_database_url(tmp_path) -> str:
+    env = os.environ.get("DATABASE_URL") or os.environ.get("CROSSING_DATABASE_URL") or ""
+    if env.startswith("postgresql"):
+        return env
+    url = f"sqlite:///{tmp_path / 'crossing.db'}"
+    os.environ["DATABASE_URL"] = url
+    return url
+
+
 @pytest.fixture
 def cx(tmp_path):
     crypto.reset_for_tests()
     db.reset_engine()
-    url = f"sqlite:///{tmp_path / 'crossing.db'}"
-    os.environ["DATABASE_URL"] = url
+    url = _test_database_url(tmp_path)
+    if url.startswith("postgresql"):
+        from crossing.models import Base
+
+        engine = db.make_engine(url)
+        Base.metadata.drop_all(engine)
+        engine.dispose()
     return Crossing(database_url=url)
 
 
