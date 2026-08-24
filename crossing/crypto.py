@@ -43,6 +43,8 @@ def require_production_secrets() -> None:
         return
     seed = os.environ.get(_SEED_ENV) or ""
     _parse_seed(seed)
+    if not (os.environ.get("CROSSING_KEY_PEPPER") or "").strip():
+        raise ProductionConfigError("CROSSING_KEY_PEPPER is required unless CROSSING_ALLOW_DEV=1")
 
 
 def signing_key() -> SigningKey:
