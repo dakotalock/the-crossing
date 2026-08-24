@@ -16,7 +16,7 @@ uvicorn crossing.api:app --reload
 
 Production refuses a missing `CROSSING_ED25519_SEED` (64 hex chars) unless `CROSSING_ALLOW_DEV=1`.
 
-HTTP mutating routes require `X-API-Key` matching `CROSSING_API_KEY`. When `CROSSING_ALLOW_DEV=1` and `CROSSING_API_KEY` is unset, the default test key is `dev` and a missing header is accepted on API routes. `GET /` (dashboard) always requires the same key (header `X-API-Key` or query `?key=`); unauthenticated dashboard requests return 401. Unauthenticated minting is forbidden when `ALLOW_DEV` is off.
+HTTP routes authenticate with header `X-API-Key` matching `CROSSING_API_KEY` (prototype: one global key). Query-string `?key=` auth was removed so the secret does not leak into history, access logs, or `Referer`. When `CROSSING_ALLOW_DEV=1` and `CROSSING_API_KEY` is unset, the default test key is `dev` and a missing header is accepted on API routes except `GET /` (dashboard always requires `X-API-Key`). Unauthenticated minting is forbidden when `ALLOW_DEV` is off. This single shared key is prototype-only; marketplace-scoped credentials are not in this round.
 
 ## Architecture
 
@@ -37,9 +37,13 @@ flowchart LR
 
 Lifecycle: **quote → authorize → reserve_and_commit → execute → commit | release**.
 
-`reserve_and_commit()` writes the reservation, decrements `remaining_cents`, inserts an `invocations` row (`reserved`), and **COMMITs before** the tool runs. A later transaction records success (ledger, receipt, billing_outbox pending) or release. Crash-after-execute-before-commit leaves a recoverable `reserved` row; it does not silently roll back the reserve.
+`reserve_and_commit()` treats **claim + reserve + invocation insert** as one savepoint. If the atomic debit fails (`BUDGET_EXCEEDED`), the LogicalOperation claim rolls back with it — the key is not left `in_progress` with no attempt. On success it **COMMITs before** the tool runs. A later transaction records success (ledger, receipt, billing_outbox pending) or release. Crash-after-execute-before-commit leaves a recoverable `reserved` ExecutionAttempt; it does not silently roll back the reserve.
 
-Recovery (`ledger.recover_reserved`): default `mode="ambiguous"`. A `reserved` row with no outcome is marked `ambiguous` and remaining is **not** refunded. Operators inspect ambiguous invocations. Only explicit `mode="release"` refunds, and only when execute can be proven never to have started.
+**LogicalOperation vs ExecutionAttempt:** `IdempotencyRecord` is the logical operation (unique `(principal_id, idempotency_key)`). `Invocation` is an execution attempt; the unique index on `(principal_id, idempotency_key)` was dropped so a released attempt can be retried under the same key. Completed claims still replay. An `in_progress` claim still returns `IN_PROGRESS` (wait-or-conflict) unless it was rolled back or explicitly released for retry.
+
+Budget debit is one conditional `UPDATE … RETURNING` on the mandate row (`remaining_cents >= cost AND revoked = 0`). That is atomic per row on SQLite and Postgres. Multi-host isolation is **not** fully solved: CI and default tests are still SQLite-only.
+
+Recovery (`ledger.recover_reserved`): default `mode="ambiguous"` marks the attempt `ambiguous`, does **not** refund, and does **not** clear the LogicalOperation claim (retry stays blocked). Explicit `mode="release"` refunds remaining, marks the attempt released, and deletes the matching `IdempotencyRecord` so the same key can start a new attempt. Only use release when execute can be proven never to have started. The MCP execute-fail path already deletes an `in_progress` claim after release.
 
 Child mandates are *attenuated*: child spend must be `> 0` and `<= parent remaining` and `<= parent spend_limit`; max_call, tools/servers subset, expiry not later than parent, `max_subagent_budget <= remaining`. Issuing a child **escrows** the child's spend cap from the parent remaining budget. Negative child spend is rejected and cannot mint parent budget.
 
@@ -56,28 +60,31 @@ In scope (enforced in-process):
 | Forged mandate / minted authority | Issuer key is the trust root; request pubkeys must already be bound |
 | Tampered enforcement columns | Reconstruct signed payload; deny `SIGNED_STATE_DIVERGED` |
 | Tampered receipt | Ed25519 over canonical receipt body (hashes by default) |
-| Overspend / TOCTOU | Durable reserve commit before execute; `BEGIN IMMEDIATE` |
-| Crash after execute | `invocations` row stays `reserved`; recover_reserved defaults to `ambiguous` (no refund) |
+| Overspend / TOCTOU | Atomic per-row debit (`UPDATE … RETURNING`); durable reserve commit before execute; `BEGIN IMMEDIATE` on SQLite |
+| Crash after execute | `invocations` attempt stays `reserved`; recover_reserved defaults to `ambiguous` (no refund, claim kept) |
 | Child privilege escalation | Attenuation + agent descendant check |
 | Negative child mint | Domain + API + SQLite CHECK `>= 0`; child spend `> 0` |
 | Replay | `used_nonces` unique per principal; mandate nonce unique |
-| Duplicate / confused charge | Unique claim insert (`in_progress`) before reserve; `idempotency_key` + `request_hash`; conflict if hash differs; in-progress wait-or-conflict |
+| Duplicate / confused charge | LogicalOperation claim insert (`in_progress`) in the same savepoint as reserve; `idempotency_key` + `request_hash`; conflict if hash differs; in-progress wait-or-conflict |
 | Revoked operator | Agent + descendant revoke |
 | Billing side effects | True outbox: Stripe only in `drain_outbox()` after COMMIT |
 | Tool blast radius | Mandate tools/servers allow-lists; purchase ($5) denied when only search is granted |
-| Unauthenticated mint | `X-API-Key` required when `CROSSING_ALLOW_DEV` is off; dashboard always requires the key |
+| Unauthenticated mint | `X-API-Key` header only (no `?key=`); required when `CROSSING_ALLOW_DEV` is off; dashboard always requires the header |
 
 Out of scope for this MVP:
 
-- Multi-host consensus / serializable isolation across Postgres replicas
+- Multi-host consensus / serializable isolation across Postgres replicas (debit is atomic per mandate row; that is not the same as multi-host isolation)
 - Hardware key custody (seed is an env var)
 - Network-level MCP attestation of upstream servers
+- Exactly-once execution at vendor / upstream MCP (Crossing forwards `invocation_id` / `idempotency_key` to the mock provider; it only guarantees at-most-one *dispatch from Crossing*)
+- Marketplace-scoped API credentials (one global `CROSSING_API_KEY` is prototype-only)
+- Real-money / production payment readiness
 - Legal enforceability of a mandate in any jurisdiction
 
 ## HTTP
 
 - `GET /health`
-- `GET /` dashboard (plain HTML tables; `X-API-Key` or `?key=` required)
+- `GET /` dashboard (plain HTML tables; `X-API-Key` header required, not `?key=`)
 - `POST/GET /v1/principals`
 - `POST/GET /v1/agents` and `POST /v1/agents/{id}/revoke`
 - `POST /v1/mandates` `GET /v1/mandates/{id}`
@@ -101,6 +108,8 @@ r = cx.invoke(m.id, "search", {"q": "hi"}, idempotency_key="k1")
 assert r.ok and cx.verify_receipt(r.receipt)
 ```
 
+Crossing forwards a stable `invocation_id` and the `idempotency_key` into `mock_mcp.call_tool`. That is a hint for a provider that can honor it. Crossing still only guarantees at-most-one dispatch from Crossing, not exactly-once at the vendor.
+
 ## Pricing (mock MCP)
 
 | Tool | Price |
@@ -113,3 +122,13 @@ Stripe: if `STRIPE_SECRET_KEY` is unset the adapter no-ops **and still writes a 
 ## Postgres
 
 Install `psycopg[binary]` (listed in `requirements.txt`) and set `DATABASE_URL=postgresql+psycopg://crossing:crossing@localhost:5432/crossing`.
+
+The mandate debit is now an atomic conditional update per row (works on SQLite and Postgres). Default tests still run against SQLite. Do not treat multi-host races as solved until Postgres is in CI and the deployment uses a single primary with row-level updates.
+
+## Review r4 (honest)
+
+- Claim + reserve + invocation insert share one savepoint; budget deny does not poison the key as `in_progress`.
+- `IdempotencyRecord` = LogicalOperation; `Invocation` = ExecutionAttempt (same key may have multiple attempts).
+- `recover_reserved(mode="release")` refunds and clears the claim so the key is retryable. Default `ambiguous` does neither.
+- Debit is atomic per mandate row. Not real-money-ready. Not exactly-once at vendors.
+- Dashboard auth is `X-API-Key` only.
