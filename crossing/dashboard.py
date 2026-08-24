@@ -29,13 +29,13 @@ def _table(title: str, headers: list[str], rows: Iterable[Iterable[Any]]) -> str
 
 def landing() -> str:
     return f"""<!doctype html>
-<html lang=\"en\">
+<html lang="en">
 <head>
-<meta charset=\"utf-8\"/>
-<meta name=\"viewport\" content=\"width=device-width, initial-scale=1\"/>
+<meta charset="utf-8"/>
+<meta name="viewport" content="width=device-width, initial-scale=1"/>
 <title>The Crossing</title>
-<link rel=\"preconnect\" href=\"https://fonts.googleapis.com\"/>
-<link rel=\"stylesheet\" href=\"{FONT}\"/>
+<link rel="preconnect" href="https://fonts.googleapis.com"/>
+<link rel="stylesheet" href="{FONT}"/>
 <style>
 :root {{
   --ink: #e8e4d9;
@@ -45,7 +45,7 @@ def landing() -> str:
 * {{ box-sizing: border-box; margin: 0; padding: 0; }}
 html, body {{ height: 100%; }}
 body {{
-  font-family: \"Source Sans 3\", system-ui, sans-serif;
+  font-family: "Source Sans 3", system-ui, sans-serif;
   color: var(--ink);
   background: #07080c;
 }}
@@ -53,7 +53,7 @@ body {{
   min-height: 100vh;
   background:
     linear-gradient(180deg, rgba(7,8,12,.35) 0%, rgba(7,8,12,.55) 45%, rgba(7,8,12,.92) 100%),
-    url(\"/static/bridge.jpg\") center 40% / cover no-repeat;
+    url("/static/bridge.jpg") center 40% / cover no-repeat;
   display: flex;
   flex-direction: column;
   justify-content: flex-end;
@@ -75,6 +75,7 @@ h1 {{
   color: var(--muted);
   letter-spacing: .04em;
 }}
+.gold {{ color: var(--gold); }}
 nav {{
   margin-top: 2rem;
   display: flex;
@@ -104,13 +105,13 @@ footer {{
 </style>
 </head>
 <body>
-  <main class=\"hero\">
+  <main class="hero">
     <h1>The<br>Crossing</h1>
-    <p class=\"tag\">Agent economic runtime. Mandates, ledgers, receipts. Authorization, not custody.</p>
+    <p class="tag">Agent economic runtime. Mandates, ledgers, receipts. Authorization, not custody.</p>
     <nav>
-      <a class=\"btn\" href=\"/docs\">API</a>
-      <a class=\"btn ghost\" href=\"/dashboard\">Operator desk</a>
-      <a class=\"btn ghost\" href=\"https://github.com/dakotalock/the-crossing\">Source</a>
+      <a class="btn" href="/docs">API</a>
+      <a class="btn ghost" href="/dashboard">Operator desk</a>
+      <a class="btn ghost" href="https://github.com/dakotalock/the-crossing">Source</a>
     </nav>
     <footer>Invite-only beta. Test-mode Stripe until we say otherwise.</footer>
   </main>
@@ -153,11 +154,11 @@ def render(session, *, account_id: str | None = None, is_admin: bool = True) -> 
     holds = hq.all()
     parts = [
         "<!doctype html><html><head><meta charset='utf-8'/><meta name='viewport' content='width=device-width, initial-scale=1'/>",
-        "<title>The Crossing desk</title>",
-        f'<link rel=\"stylesheet\" href=\"{FONT}\"/>',
+        "<title>The Crossing — desk</title>",
+        f'<link rel="stylesheet" href="{FONT}"/>',
         """<style>
-body{margin:0;background:#0c0d12;color:#e8e4d9;font-family:\"Source Sans 3\",system-ui,sans-serif}
-.banner{height:220px;background:linear-gradient(180deg,rgba(12,13,18,.2),#0c0d12),url(\"/static/bridge.jpg\") center 45%/cover;display:flex;align-items:flex-end;padding:1.5rem 2rem}
+body{margin:0;background:#0c0d12;color:#e8e4d9;font-family:"Source Sans 3",system-ui,sans-serif}
+.banner{height:220px;background:linear-gradient(180deg,rgba(12,13,18,.2),#0c0d12),url("/static/bridge.jpg") center 45%/cover;display:flex;align-items:flex-end;padding:1.5rem 2rem}
 h1{font-family:Cinzel,Palatino,serif;letter-spacing:.14em;text-transform:uppercase;margin:0;font-size:2rem}
 .wrap{padding:1.5rem 2rem 4rem}
 .panel{margin:1.4rem 0}
