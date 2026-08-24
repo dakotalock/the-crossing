@@ -32,22 +32,27 @@ def test_health_and_story(cx):
     assert recs
     one = client.get(f"/v1/receipts/{recs[0]['id']}").json()
     assert one["valid"] is True
-    html = client.get("/", headers={"X-API-Key": "dev"}).text
+    html = client.get("/dashboard", headers={"X-API-Key": "dev"}).text
     assert "principals" in html
     assert "ledger_events" in html
+    home = client.get("/").text
+    assert "The Crossing" in home
 
 
 def test_dashboard_requires_auth(cx):
     client = TestClient(app)
-    denied = client.get("/")
+    home = client.get("/")
+    assert home.status_code == 200
+    assert "The Crossing" in home.text
+    denied = client.get("/dashboard")
     assert denied.status_code == 401
-    qs = client.get("/?key=dev")
+    qs = client.get("/dashboard?key=dev")
     assert qs.status_code == 401
-    bad = client.get("/?key=wrong")
+    bad = client.get("/dashboard?key=wrong")
     assert bad.status_code == 401
-    ok_header = client.get("/", headers={"X-API-Key": "dev"})
+    ok_header = client.get("/dashboard", headers={"X-API-Key": "dev"})
     assert ok_header.status_code == 200
     assert "principals" in ok_header.text
     client.cookies.set("crossing_session", "dev")
-    cookie = client.get("/")
+    cookie = client.get("/dashboard")
     assert cookie.status_code == 200

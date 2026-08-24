@@ -120,4 +120,4 @@ def test_hostile_cross_tenant_read_write_mandate_receipt_invoke(cx):
 
 def test_dashboard_never_query_string_key(cx):
     client = TestClient(app)
-    assert client.get("/?key=dev").status_code == 401
+    assert client.get("/dashboard?key=dev").status_code == 401
