@@ -5,7 +5,7 @@ from __future__ import annotations
 import html
 from typing import Any, Iterable
 
-from crossing.models import Agent, LedgerEvent, Mandate, Outbox, Principal, Receipt, Reservation
+from crossing.models import Agent, Invocation, LedgerEvent, Mandate, Outbox, Principal, Receipt, Reservation
 
 
 def _td(v: Any) -> str:
@@ -69,12 +69,17 @@ def render(session) -> str:
         _table(
             "receipts",
             ["id", "tool", "amount", "sig"],
-            [(r.id, r.tool, r.amount_cents, r.signature[:16] + "…") for r in recs],
+            [(r.id, r.tool, r.amount_cents, r.signature[:16] + "\u2026") for r in recs],
         ),
         _table(
             "outbox",
             ["id", "status", "attempts", "error"],
             [(o.id, o.status, o.attempts, o.last_error) for o in outbox],
+        ),
+        _table(
+            "invocations",
+            ["id", "status", "tool", "mandate"],
+            [(i.id, i.status, i.tool, i.mandate_id) for i in session.query(Invocation).all()],
         ),
         "</body></html>",
     ]

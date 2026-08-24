@@ -1,4 +1,4 @@
-"""Stripe adapter. No-ops without STRIPE_SECRET_KEY but always writes outbox rows."""
+"""Stripe adapter. HTTP happens only in drain_outbox(), after the ledger commit."""
 
 from __future__ import annotations
 
@@ -7,6 +7,7 @@ import os
 from typing import Any
 
 import httpx
+from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from crossing.models import Outbox, new_id
@@ -30,6 +31,7 @@ def enqueue(
     principal_id: str,
     customer_id: str | None = None,
 ) -> Outbox:
+    """Insert a pending billing_outbox row. No HTTP."""
     payload = {
         "receipt_id": receipt_id,
         "amount_cents": amount_cents,
@@ -95,11 +97,32 @@ def flush_row(session: Session, row: Outbox) -> Outbox:
 
 
 def report_after_commit(session: Session, row: Outbox) -> Outbox:
-    """Flush Stripe after ledger commit. Failures stay on the outbox row."""
-    try:
-        return flush_row(session, row)
-    except Exception as exc:  # noqa: BLE001
-        row.status = "failed"
-        row.last_error = exc.__class__.__name__
+    """Must NOT HTTP to Stripe. Outbox row is already pending; drain after COMMIT."""
+    if row.status != "pending":
+        row.status = "pending"
         session.flush()
-        return row
+    return row
+
+
+def drain_outbox(session: Session | None = None, *, limit: int = 50) -> list[Outbox]:
+    """Send pending billing_outbox rows. Stripe failure leaves ledger intact."""
+    from crossing import db
+
+    own = session is None
+    if own:
+        session = db.get_session()
+    assert session is not None
+    try:
+        rows = list(
+            session.scalars(select(Outbox).where(Outbox.status == "pending").limit(limit)).all()
+        )
+        for row in rows:
+            flush_row(session, row)
+        session.commit()
+        return rows
+    except Exception:
+        session.rollback()
+        raise
+    finally:
+        if own:
+            session.close()
