@@ -66,7 +66,7 @@ def main() -> int:
     )
     print("child mandate", child_m.id, "child remaining", child_m.remaining_cents, "parent remaining", cx.remaining(mandate.id))
     assert child_m.remaining_cents == 50
-    assert cx.remaining(mandate.id) == 45
+    assert cx.remaining(mandate.id) == 45  # 95 - 50 escrow
 
     _step(7, "Child invoke search — succeeds")
     cr = cx.invoke(child_m.id, "search", {"q": "attenuation"}, idempotency_key="demo-child-1")
