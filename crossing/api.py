@@ -1,11 +1,12 @@
 from __future__ import annotations
 
+import json
 import os
 from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Any
 
-from fastapi import Cookie, Depends, FastAPI, Header, HTTPException
+from fastapi import Cookie, Depends, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse
 from pydantic import BaseModel, Field
@@ -16,7 +17,7 @@ from crossing.dashboard import render
 from crossing.identity import create_agent, create_principal, revoke_agent
 from crossing.lifecycle import invoke
 from crossing.mandate import issue_mandate, revoke_mandate
-from crossing.models import Agent, ApiKey, Mandate, Principal, Receipt
+from crossing.models import Account, Agent, ApiKey, Mandate, Principal, Receipt
 from crossing.policy import PolicyDenied, Reason
 from crossing.receipts import to_dict, verify_receipt
 
@@ -169,6 +170,10 @@ class ReconcileIn(BaseModel):
     outcome: str  # committed | released
     evidence_ref: str
     evidence_kind: str
+
+
+class StripeCustomerIn(BaseModel):
+    stripe_customer_id: str
 
 
 @app.get("/health")
@@ -480,3 +485,58 @@ def post_reconcile(
             "status": result.invocation.status,
             "reservation_status": result.reservation.status if result.reservation is not None else None,
         }
+
+
+@app.post("/v1/stripe/webhooks")
+async def stripe_webhook(request: Request) -> dict[str, Any]:
+    from sqlalchemy.exc import IntegrityError
+
+    from crossing import billing
+
+    payload = await request.body()
+    sig = request.headers.get("stripe-signature")
+    if not billing.verify_webhook_signature(payload, sig):
+        raise HTTPException(status_code=400, detail="invalid signature")
+    try:
+        event = json.loads(payload.decode("utf-8"))
+    except (UnicodeDecodeError, json.JSONDecodeError) as exc:
+        raise HTTPException(status_code=400, detail="invalid json") from exc
+    if not isinstance(event, dict) or not event.get("id"):
+        raise HTTPException(status_code=400, detail="missing event id")
+    try:
+        with db.session_scope() as s:
+            _row, inserted = billing.record_stripe_event(s, event)
+    except IntegrityError:
+        return {"ok": True, "duplicate": True}
+    except ValueError as exc:
+        raise HTTPException(status_code=400, detail=str(exc)) from exc
+    return {"ok": True, "duplicate": not inserted}
+
+
+@app.post("/v1/admin/accounts/{account_id}/stripe-customer")
+def post_admin_stripe_customer(
+    account_id: str,
+    body: StripeCustomerIn,
+    ctx: AuthContext = Depends(require_scope("admin")),
+) -> dict[str, Any]:
+    from crossing import billing
+
+    with db.session_scope() as s:
+        acct = s.get(Account, account_id)
+        if acct is None:
+            raise _closed()
+        if not ctx.is_admin:
+            raise _forbidden()
+        acct = billing.attach_stripe_customer(s, account_id, body.stripe_customer_id)
+        return {
+            "account_id": acct.id,
+            "stripe_customer_present": bool(acct.stripe_customer_id),
+        }
+
+
+@app.get("/v1/billing/status")
+def get_billing_status(ctx: AuthContext = Depends(require_scope("billing:read"))) -> dict[str, Any]:
+    from crossing import billing
+
+    with db.session_scope() as s:
+        return billing.billing_status(s, ctx.account_id)
