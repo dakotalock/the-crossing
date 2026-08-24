@@ -467,3 +467,4 @@ def test_finalize_success_refuses_reserved_without_executing(seeded):
         claim = s.query(IdempotencyRecord).filter_by(idempotency_key="r8-no-exec").one()
         assert claim.status == "in_progress"
     assert cx.remaining(m.id) == 95
+
