@@ -9,12 +9,13 @@ from typing import Any
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from crossing import billing, ledger, mock_mcp, pricing, receipts
+from crossing import abuse, billing, ledger, metrics, pricing, providers, receipts
 from crossing.identity import create_task
 from crossing.ledger import IdempotencyReplay
 from crossing.mandate import load_live_mandate
 from crossing.models import IdempotencyRecord, UsedNonce, new_id
 from crossing.policy import PolicyDenied, Reason, check_tool
+from crossing.providers import ProviderError
 from crossing.receipts import payload_hash
 
 
@@ -61,7 +62,7 @@ def request_fingerprint(mandate_id: str, server: str, tool: str, arguments: dict
 
 def quote(tool: str, server: str = pricing.DEFAULT_SERVER) -> int:
     try:
-        return pricing.quote(tool, server)
+        return providers.quote(tool, server)
     except KeyError as exc:
         raise PolicyDenied(Reason.UNKNOWN_TOOL, str(exc)) from exc
 
@@ -109,6 +110,7 @@ def _deny(
     idempotency_key: str | None = None,
     task_id: str | None = None,
 ) -> InvokeResult:
+    metrics.inc_deny(reason)
     if principal_id:
         ledger.append_event(
             session,
@@ -202,6 +204,7 @@ def invoke(
     try:
         price = quote(tool, server)
         check_tool(mandate, tool, server, price)
+        abuse.validate_arguments(tool, arguments)
     except PolicyDenied as exc:
         return _deny(
             session,
@@ -263,13 +266,14 @@ def invoke(
         )
 
     try:
-        tool_result = mock_mcp.call_tool(
+        tool_result = providers.invoke(
+            server,
             tool,
             arguments or {},
             invocation_id=invocation.id,
             idempotency_key=idempotency_key,
         )
-    except Exception as exc:
+    except (ProviderError, Exception) as exc:
         # Provider may have run. Do not refund or clear the claim.
         ledger.mark_executed_fail(session, invocation)
         return InvokeResult(
@@ -354,4 +358,5 @@ def invoke(
         task_id=task_id,
     )
     billing.drain_outbox()
+    metrics.inc_invoke()
     return result
