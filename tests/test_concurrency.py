@@ -72,6 +72,11 @@ def test_ten_threads_cannot_overspend(cx):
     assert rem == 0
     spent = sum(r.amount_cents for r in oks)
     assert spent == 100
+    from crossing.models import IdempotencyRecord
+
+    with cx.session() as s:
+        leftover = [c for c in s.query(IdempotencyRecord).all() if c.status == "in_progress"]
+        assert leftover == [], [(c.idempotency_key, c.status) for c in leftover]
 
 
 def test_same_idempotency_key_one_execution(cx):
@@ -101,7 +106,7 @@ def test_same_idempotency_key_one_execution(cx):
     calls: list = []
     lock = threading.Lock()
 
-    def slow_search(args):
+    def slow_search(args, **_ids):
         with lock:
             calls.append(args)
         time.sleep(0.4)
