@@ -65,6 +65,11 @@ def reserve(
     """
     if amount_cents < 0:
         raise PolicyDenied(Reason.INVALID_AMOUNT, "reserve amount must be >= 0")
+    from crossing.models import utcnow as _utcnow
+
+    now = _utcnow()
+    bind = session.get_bind()
+    now_sql = now.replace(tzinfo=None) if bind is not None and bind.dialect.name == "sqlite" else now
     row = session.execute(
         update(Mandate)
         .where(
@@ -72,11 +77,13 @@ def reserve(
             Mandate.remaining_cents >= amount_cents,
             Mandate.revoked.is_(False),
             or_(Mandate.max_calls.is_(None), Mandate.calls_used < Mandate.max_calls),
+            or_(Mandate.expires_at.is_(None), Mandate.expires_at > now_sql),
         )
         .values(
             remaining_cents=Mandate.remaining_cents - amount_cents,
             calls_used=Mandate.calls_used + 1,
         )
+        .execution_options(synchronize_session=False)
         .returning(Mandate.remaining_cents, Mandate.calls_used)
     ).first()
     if row is None:
@@ -133,6 +140,12 @@ def _reserve_deny_reason(locked: Mandate | None, amount_cents: int) -> str:
     """
     if locked is None or locked.revoked:
         return Reason.BUDGET_EXCEEDED
+    exp = locked.expires_at
+    if exp is not None:
+        from crossing.policy import as_utc, utcnow as _now
+        e = as_utc(exp)
+        if e is not None and as_utc(_now()) > e:
+            return Reason.MANDATE_EXPIRED
     if locked.remaining_cents < amount_cents:
         return Reason.BUDGET_EXCEEDED
     if locked.max_calls is not None and locked.calls_used >= locked.max_calls:
@@ -243,7 +256,7 @@ def reserve_and_commit(
             session.flush()
     except PolicyDenied as exc:
         session.refresh(mandate)
-        if exc.reason in (Reason.BUDGET_EXCEEDED, Reason.MAX_CALLS_EXCEEDED):
+        if exc.reason in (Reason.BUDGET_EXCEEDED, Reason.MAX_CALLS_EXCEEDED, Reason.MANDATE_EXPIRED):
             append_event(
                 session,
                 principal_id=mandate.principal_id,
@@ -543,7 +556,7 @@ def finalize_release(
     invocation: Invocation,
     reservation: Reservation | None = None,
     *,
-    allowed_statuses: tuple[str, ...] = ("reserved", "executed_fail"),
+    allowed_statuses: tuple[str, ...] = ("reserved",),
     commit_txn: bool = True,
 ) -> FinalizeResult:
     """CAS reservation held→released AND invocation allowed→released together.
@@ -762,6 +775,8 @@ def reconcile_commit(
     Never overwrite committed/released. Lost CAS is a no-op returning current.
     """
     _require_evidence(evidence_ref, evidence_kind)
+    if evidence_kind != EVIDENCE_DID_EXECUTE:
+        raise PolicyDenied(Reason.UNAUTHORIZED, "reconcile_commit requires evidence_kind did_execute")
     reservation = session.get(Reservation, invocation.reservation_id) if invocation.reservation_id else None
     from_status = invocation.status
     receipt = None
