@@ -37,13 +37,26 @@ def main(argv: list[str] | None = None) -> int:
         metavar=("ACCOUNT_ID", "CUS_ID"),
         help="admin: attach a Stripe customer id to an account, then exit",
     )
+    parser.add_argument(
+        "--requeue-dead",
+        metavar="OUTBOX_ID",
+        nargs="?",
+        const="*",
+        help="admin: requeue dead outbox row(s) to pending (omit id for all)",
+    )
     args = parser.parse_args(argv)
     if os.environ.get("CROSSING_ALLOW_DEV") != "1":
         crypto.require_production_secrets()
         auth.key_pepper()
     db.init_db()
+    billing.warn_unsent_fees()
     if args.attach_customer:
         attach_customer(args.attach_customer[0], args.attach_customer[1])
+        return 0
+    if args.requeue_dead:
+        with db.session_scope() as s:
+            oid = None if args.requeue_dead == "*" else args.requeue_dead
+            billing.requeue_dead(s, oid)
         return 0
     if args.once:
         run_once(limit=args.limit)

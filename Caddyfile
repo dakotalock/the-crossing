@@ -1,4 +1,7 @@
-# Staging example. Put TLS at the edge in production.
+# Staging / local example on :80.
+# TLS is required if this edge is on the internet. Production must use a
+# hostname site block with automatic HTTPS, e.g.
+#   example.com { reverse_proxy api:8000 }
 :80 {
 	reverse_proxy api:8000
 }
