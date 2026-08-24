@@ -3,12 +3,23 @@ from __future__ import annotations
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
-from crossing.models import Agent, Principal, Task, new_id
+from crossing.models import Account, Agent, Principal, Task, new_id
 from crossing.policy import PolicyDenied, Reason, check_agent
 
 
-def create_principal(session: Session, name: str, pubkey_hex: str | None = None) -> Principal:
-    p = Principal(id=new_id(), name=name, pubkey_hex=pubkey_hex)
+def create_principal(
+    session: Session,
+    name: str,
+    pubkey_hex: str | None = None,
+    *,
+    account_id: str | None = None,
+) -> Principal:
+    if account_id is None:
+        acct = Account(id=new_id(), name=name)
+        session.add(acct)
+        session.flush()
+        account_id = acct.id
+    p = Principal(id=new_id(), account_id=account_id, name=name, pubkey_hex=pubkey_hex)
     session.add(p)
     session.flush()
     return p
