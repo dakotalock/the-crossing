@@ -205,6 +205,8 @@ def invoke(
         price = quote(tool, server)
         check_tool(mandate, tool, server, price)
         abuse.validate_arguments(tool, arguments)
+        if billing.configured():
+            billing.require_billable(session, mandate.principal_id)
     except PolicyDenied as exc:
         return _deny(
             session,
@@ -314,17 +316,23 @@ def invoke(
     remaining_now = session.get(type(mandate), mandate.id).remaining_cents
 
     def _result_payload(rec):
+        rec_dict = receipts.to_dict(rec) if rec is not None else None
         built = InvokeResult(
             ok=True,
             amount_cents=price,
             remaining_cents=remaining_now,
-            receipt=receipts.to_dict(rec) if rec is not None else None,
-            result=tool_result,
+            receipt=rec_dict,
+            result=None,
             reservation_id=reservation.id,
             idempotency_key=idempotency_key,
             task_id=task_id,
         )
-        return json.dumps(built.to_dict())
+        data = built.to_dict()
+        if not receipts.retain_payloads() and isinstance(data.get("receipt"), dict):
+            body = data["receipt"].get("body")
+            if isinstance(body, dict):
+                body.pop("result", None)
+        return json.dumps(data)
 
     fin = ledger.finalize_success(
         session,
@@ -357,6 +365,5 @@ def invoke(
         idempotency_key=idempotency_key,
         task_id=task_id,
     )
-    billing.drain_outbox()
     metrics.inc_invoke()
     return result
