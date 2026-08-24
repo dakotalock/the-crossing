@@ -74,6 +74,7 @@ REQUIRED_TABLES = (
     "invocations",
     "api_keys",
     "reconciliation_events",
+    "stripe_events",
 )
 
 
@@ -89,7 +90,9 @@ def init_db(url: str | None = None) -> Engine:
     from crossing.crypto import ProductionConfigError, allow_dev
 
     _engine = make_engine(url)
-    if allow_dev():
+    # Dev may create_all only when the schema is absent. Alembic-applied DBs
+    # (CI postgres job) must not be rewritten by create_all.
+    if allow_dev() and not schema_ready(_engine):
         Base.metadata.create_all(_engine)
     elif not schema_ready(_engine):
         raise ProductionConfigError(
@@ -136,6 +139,22 @@ def session_scope() -> Iterator[Session]:
         raise
     finally:
         session.close()
+
+
+def truncate_all(engine: Engine | None = None) -> None:
+    """Empty application tables, keeping alembic_version. Used by postgres tests."""
+    engine = engine or get_engine()
+    insp = inspect(engine)
+    tables = [t for t in insp.get_table_names() if t != "alembic_version"]
+    if not tables:
+        return
+    with engine.begin() as conn:
+        if engine.dialect.name == "postgresql":
+            quoted = ", ".join('"' + t + '"' for t in tables)
+            conn.exec_driver_sql("TRUNCATE TABLE " + quoted + " RESTART IDENTITY CASCADE")
+        else:
+            for t in tables:
+                conn.exec_driver_sql("DELETE FROM " + t)
 
 
 def reset_engine() -> None:
