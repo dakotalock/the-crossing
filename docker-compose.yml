@@ -1,11 +1,15 @@
 # Staging example: Caddy → FastAPI → Postgres + worker.
 # cp .env.example .env  (fill locally; never commit secrets)
+#
+# Postgres is bound to 127.0.0.1 only (not 0.0.0.0). For internet-facing
+# deploys, omit the host port and keep Postgres on the compose network.
+# POSTGRES_PASSWORD comes from the environment; the default is local-only.
 services:
   postgres:
     image: postgres:16-alpine
     environment:
       POSTGRES_USER: crossing
-      POSTGRES_PASSWORD: crossing
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:-crossing-dev-local-only}
       POSTGRES_DB: crossing
     volumes:
       - crossing_pg:/var/lib/postgresql/data
@@ -15,7 +19,7 @@ services:
       timeout: 5s
       retries: 10
     ports:
-      - "5432:5432"
+      - "127.0.0.1:5432:5432"
     profiles: ["postgres", "staging"]
 
   api:
@@ -25,7 +29,7 @@ services:
     env_file:
       - .env
     environment:
-      DATABASE_URL: postgresql+psycopg://crossing:crossing@postgres:5432/crossing
+      DATABASE_URL: postgresql+psycopg://crossing:${POSTGRES_PASSWORD:-crossing-dev-local-only}@postgres:5432/crossing
     depends_on:
       postgres:
         condition: service_healthy
@@ -51,7 +55,7 @@ services:
     env_file:
       - .env
     environment:
-      DATABASE_URL: postgresql+psycopg://crossing:crossing@postgres:5432/crossing
+      DATABASE_URL: postgresql+psycopg://crossing:${POSTGRES_PASSWORD:-crossing-dev-local-only}@postgres:5432/crossing
     depends_on:
       postgres:
         condition: service_healthy
