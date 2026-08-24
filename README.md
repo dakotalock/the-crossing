@@ -41,7 +41,7 @@ Lifecycle: **quote → authorize → reserve_and_commit → execute → commit |
 
 **LogicalOperation vs ExecutionAttempt:** `IdempotencyRecord` is the logical operation (unique `(principal_id, idempotency_key)`). `Invocation` is an execution attempt; the unique index on `(principal_id, idempotency_key)` was dropped so a released attempt can be retried under the same key. Completed claims still replay. An `in_progress` claim still returns `IN_PROGRESS` (wait-or-conflict) unless it was rolled back or explicitly released for retry.
 
-Budget debit is one conditional `UPDATE … RETURNING` on the mandate row (`remaining_cents >= cost AND revoked = 0`). That is atomic per row on SQLite and Postgres. Multi-host isolation is **not** fully solved: CI and default tests are still SQLite-only.
+Scarce-authority transitions are conditional `UPDATE … RETURNING` on SQLite and Postgres: mandate debit (`remaining_cents >= cost AND revoked = 0 AND (max_calls IS NULL OR calls_used < max_calls)`), child-mandate escrow from parent remaining, and reservation `held → committed|released` CAS. CI runs a `sqlite` job and a `postgres` job. Multi-host isolation is still **not** fully solved (one primary, row-level updates — not consensus across replicas).
 
 Recovery (`ledger.recover_reserved`): default `mode="ambiguous"` marks the attempt `ambiguous`, does **not** refund, and does **not** clear the LogicalOperation claim (retry stays blocked). Explicit `mode="release"` refunds remaining, marks the attempt released, and deletes the matching `IdempotencyRecord` so the same key can start a new attempt. Only use release when execute can be proven never to have started. The MCP execute-fail path already deletes an `in_progress` claim after release.
 
@@ -123,12 +123,19 @@ Stripe: if `STRIPE_SECRET_KEY` is unset the adapter no-ops **and still writes a 
 
 Install `psycopg[binary]` (listed in `requirements.txt`) and set `DATABASE_URL=postgresql+psycopg://crossing:crossing@localhost:5432/crossing`.
 
-The mandate debit is now an atomic conditional update per row (works on SQLite and Postgres). Default tests still run against SQLite. Do not treat multi-host races as solved until Postgres is in CI and the deployment uses a single primary with row-level updates.
+The mandate debit, child escrow, and reservation terminal transitions are conditional updates (SQLite and Postgres). Local default is still SQLite. CI has a `postgres` job (`DATABASE_URL=postgresql+psycopg://…`). That is not multi-host consensus.
 
-## Review r4 (honest)
+## Review r5 (honest)
+
+- Scarce-authority transitions are conditional `UPDATE`s (debit + `max_calls`, child escrow, reservation CAS). Failed debit distinguishes `BUDGET_EXCEEDED` vs `MAX_CALLS_EXCEEDED`; PolicyDenied and the deny ledger note match.
+- CI has a `sqlite` job and a `postgres` job. Local pytest still defaults to a temp SQLite file unless `DATABASE_URL` is postgres.
+- Still one global `CROSSING_API_KEY` (prototype-only).
+- Still at-most-one Crossing dispatch, not provider exactly-once.
+- Still not real-money-ready.
+
+## Review r4 (kept)
 
 - Claim + reserve + invocation insert share one savepoint; budget deny does not poison the key as `in_progress`.
 - `IdempotencyRecord` = LogicalOperation; `Invocation` = ExecutionAttempt (same key may have multiple attempts).
 - `recover_reserved(mode="release")` refunds and clears the claim so the key is retryable. Default `ambiguous` does neither.
-- Debit is atomic per mandate row. Not real-money-ready. Not exactly-once at vendors.
 - Dashboard auth is `X-API-Key` only.

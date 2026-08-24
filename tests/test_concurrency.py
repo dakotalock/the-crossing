@@ -161,3 +161,224 @@ def test_same_idempotency_key_one_execution(cx):
             assert o.reason in ("IN_PROGRESS", "IDEMPOTENCY_CONFLICT") or o.replayed
         elif getattr(o, "replayed", False):
             pass
+
+
+def test_max_calls_atomic_under_race(cx):
+    """max_calls=1, plenty of remaining: N concurrent invokes → exactly one success."""
+    from datetime import datetime, timedelta, timezone
+
+    from crossing.models import LedgerEvent, Mandate
+    from crossing.policy import Reason
+
+    n = 8
+    with db.session_scope() as s:
+        p = create_principal(s, "MaxCallRacer")
+        a = create_agent(s, p.id, "bot")
+        m = issue_mandate(
+            s,
+            principal_id=p.id,
+            agent_id=a.id,
+            spend_limit_cents=1000,
+            max_call_cents=100,
+            max_calls=1,
+            tools=["search"],
+            servers=["mock"],
+            expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
+        )
+        mid = m.id
+
+    results: list = []
+    lock = threading.Lock()
+
+    def worker(i: int) -> None:
+        session = db.get_session()
+        try:
+            r = invoke(
+                session,
+                mandate_id=mid,
+                tool="search",
+                arguments={"q": str(i)},
+                idempotency_key=f"max-calls-{i}",
+                nonce=f"max-calls-n-{i}",
+            )
+            session.commit()
+            with lock:
+                results.append(r)
+        except Exception as exc:  # noqa: BLE001
+            session.rollback()
+            with lock:
+                results.append(exc)
+        finally:
+            session.close()
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(n)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    oks = [r for r in results if getattr(r, "ok", False)]
+    dens = [r for r in results if getattr(r, "ok", True) is False]
+    assert len(oks) == 1, [(getattr(r, "ok", None), getattr(r, "reason", r)) for r in results]
+    assert len(dens) == n - 1
+    assert all(d.reason == Reason.MAX_CALLS_EXCEEDED for d in dens)
+    with cx.session() as s:
+        row = s.get(Mandate, mid)
+        assert row.calls_used == 1
+        assert row.remaining_cents == 1000 - 5
+        denies = [e for e in s.query(LedgerEvent).all() if e.kind == "deny"]
+        assert denies
+        assert all(e.note == Reason.MAX_CALLS_EXCEEDED for e in denies)
+
+
+def test_concurrent_child_escrow_cannot_over_allocate(cx):
+    """Parent remaining 100; two $80 children → one succeeds, parent remaining 20."""
+    from datetime import datetime, timedelta, timezone
+
+    from crossing.models import Mandate
+    from crossing.policy import PolicyDenied, Reason
+
+    exp = datetime.now(timezone.utc) + timedelta(hours=1)
+    with db.session_scope() as s:
+        p = create_principal(s, "ChildEscrowRacer")
+        a = create_agent(s, p.id, "parent")
+        child = create_agent(s, p.id, "kid", parent_id=a.id)
+        m = issue_mandate(
+            s,
+            principal_id=p.id,
+            agent_id=a.id,
+            spend_limit_cents=100,
+            max_call_cents=100,
+            max_subagent_budget_cents=100,
+            tools=["search"],
+            servers=["mock"],
+            expires_at=exp,
+        )
+        mid, pid, cid = m.id, p.id, child.id
+
+    results: list = []
+    lock = threading.Lock()
+
+    def worker(i: int) -> None:
+        session = db.get_session()
+        try:
+            cm = issue_mandate(
+                session,
+                principal_id=pid,
+                agent_id=cid,
+                spend_limit_cents=80,
+                max_call_cents=80,
+                max_subagent_budget_cents=80,
+                tools=["search"],
+                servers=["mock"],
+                expires_at=exp,
+                parent_mandate_id=mid,
+            )
+            session.commit()
+            with lock:
+                results.append(cm)
+        except Exception as exc:  # noqa: BLE001
+            session.rollback()
+            with lock:
+                results.append(exc)
+        finally:
+            session.close()
+
+    threads = [threading.Thread(target=worker, args=(i,)) for i in range(2)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    kids = [r for r in results if isinstance(r, Mandate)]
+    fails = [r for r in results if r not in kids]
+    assert len(kids) == 1, results
+    assert len(fails) == 1
+    assert isinstance(fails[0], PolicyDenied)
+    assert fails[0].reason == Reason.CHILD_SPEND_ESCALATION
+    assert cx.remaining(mid) == 20
+    with cx.session() as s:
+        children = [row for row in s.query(Mandate).all() if row.parent_mandate_id == mid]
+        assert len(children) == 1
+        assert sum(c.spend_limit_cents for c in children) == 80
+
+
+def test_commit_and_release_cas_one_winner(cx):
+    """Concurrent commit and release on one hold: one terminal event, no over-refund."""
+    from datetime import datetime, timedelta, timezone
+
+    from crossing import ledger
+    from crossing.mandate import load_live_mandate
+    from crossing.models import LedgerEvent, Mandate, Reservation
+
+    with db.session_scope() as s:
+        p = create_principal(s, "CasRacer")
+        a = create_agent(s, p.id, "bot")
+        m = issue_mandate(
+            s,
+            principal_id=p.id,
+            agent_id=a.id,
+            spend_limit_cents=100,
+            max_call_cents=100,
+            tools=["search"],
+            servers=["mock"],
+            expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
+        )
+        res = ledger.reserve(s, load_live_mandate(s, m.id), 5)
+        rid, mid, original = res.id, m.id, m.spend_limit_cents
+
+    lock = threading.Lock()
+    outcomes: list = []
+
+    def do_commit() -> None:
+        session = db.get_session()
+        try:
+            r = session.get(Reservation, rid)
+            out = ledger.commit(session, r)
+            session.commit()
+            with lock:
+                outcomes.append(("commit", out.status))
+        except Exception as exc:  # noqa: BLE001
+            session.rollback()
+            with lock:
+                outcomes.append(("commit", exc))
+        finally:
+            session.close()
+
+    def do_release() -> None:
+        session = db.get_session()
+        try:
+            r = session.get(Reservation, rid)
+            out = ledger.release(session, r)
+            session.commit()
+            with lock:
+                outcomes.append(("release", out.status))
+        except Exception as exc:  # noqa: BLE001
+            session.rollback()
+            with lock:
+                outcomes.append(("release", exc))
+        finally:
+            session.close()
+
+    threads = [threading.Thread(target=do_commit), threading.Thread(target=do_release)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    remaining = cx.remaining(mid)
+    assert remaining <= original
+    with cx.session() as s:
+        hold = s.get(Reservation, rid)
+        assert hold.status in ("committed", "released")
+        terminals = [e for e in s.query(LedgerEvent).all() if e.kind in ("commit", "release")]
+        assert len(terminals) == 1
+        row = s.get(Mandate, mid)
+        if hold.status == "committed":
+            assert remaining == original - 5
+            assert row.calls_used == 1
+            assert terminals[0].kind == "commit"
+        else:
+            assert remaining == original
+            assert row.calls_used == 0
+            assert terminals[0].kind == "release"
