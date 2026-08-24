@@ -158,6 +158,20 @@ def key_id() -> str:
     return kid
 
 
+def issuer_keys() -> dict[str, str]:
+    """kid -> pubkey_hex for keys this process will treat as Crossing issuers."""
+    return {key_id(): pubkey_hex()}
+
+
+def published_keys() -> dict[str, Any]:
+    """Public key directory. A receipt is only valid if its kid is listed here."""
+    return {
+        "v": 1,
+        "alg": "Ed25519",
+        "keys": [{"kid": kid, "pubkey_hex": pk, "alg": "Ed25519"} for kid, pk in issuer_keys().items()],
+    }
+
+
 def canonical_dumps(obj: Any) -> bytes:
     return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
 
