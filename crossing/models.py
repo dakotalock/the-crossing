@@ -15,7 +15,6 @@ from sqlalchemy import (
     String,
     Text,
     UniqueConstraint,
-    text,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
@@ -194,7 +193,8 @@ class IdempotencyRecord(Base):
     principal_id: Mapped[str] = mapped_column(String(36), index=True)
     idempotency_key: Mapped[str] = mapped_column(String(120))
     request_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    # in_progress | completed — claim row is inserted before reserve
+    # LogicalOperation: unique (principal_id, idempotency_key)
+    # in_progress | completed — claim is the at-most-one gate for a logical op
     status: Mapped[str] = mapped_column(String(20), default="in_progress")
     result_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
@@ -211,18 +211,11 @@ class UsedNonce(Base):
 
 
 class Invocation(Base):
-    """Durable operations row. reserve_and_commit writes status=reserved before execute."""
+    """ExecutionAttempt. Multiple attempts may share (principal_id, idempotency_key)."""
 
     __tablename__ = "invocations"
     __table_args__ = (
-        Index(
-            "uq_invocation_principal_idempotency_key",
-            "principal_id",
-            "idempotency_key",
-            unique=True,
-            sqlite_where=text("idempotency_key IS NOT NULL"),
-            postgresql_where=text("idempotency_key IS NOT NULL"),
-        ),
+        Index("ix_invocation_principal_idempotency_key", "principal_id", "idempotency_key"),
     )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
