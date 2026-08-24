@@ -27,6 +27,7 @@ def test_ten_threads_cannot_overspend(cx):
         )
         mid, pid = m.id, p.id
 
+    # Monkeypatch price for this test via mock + pricing
     from crossing import pricing
 
     pricing.PRICES_CENTS[("mock", "search")] = 20
@@ -153,6 +154,7 @@ def test_same_idempotency_key_one_execution(cx):
         assert len(holds) == 1
         claims = s.query(IdempotencyRecord).all()
         assert len(claims) == 1
+    # loser is in-progress, replay, or a wait-or-conflict deny — not a second execute
     if others:
         o = others[0]
         if getattr(o, "ok", None) is False:
@@ -202,10 +204,10 @@ def test_max_calls_atomic_under_race(cx):
             session.commit()
             with lock:
                 results.append(r)
-        except Exception as exc:  # noqa: BLE001
+        except Exception as exec:  # noqa: BLE001
             session.rollback()
             with lock:
-                results.append(exc)
+                results.append(exec)
         finally:
             session.close()
 
@@ -503,12 +505,12 @@ def test_finalize_success_vs_recover_release_one_universe(cx):
             assert remaining == original
             assert mandate.remaining_cents == original
             assert mandate.calls_used == 0
+        # Never both billed and refunded; never committed hold + cleared claim.
         billed = outbox_n > 0
         refunded = remaining == original
         assert not (billed and refunded)
         assert not (hold.status == "committed" and claim is None)
         assert not (receipts_n > 0 and refunded)
-
 
 def test_recover_ambiguous_cannot_overwrite_committed(cx):
     """Stale executing object must not CAS/ORM-write committed → ambiguous."""
@@ -545,6 +547,8 @@ def test_recover_ambiguous_cannot_overwrite_committed(cx):
         assert marked.won
         stale = s_stale.get(Invocation, iid)
         assert stale.status == "executing"
+        # Release SQLite BEGIN IMMEDIATE so the other session can finalize.
+        # expire_on_commit=False keeps this identity-map row stale as executing.
         s_stale.commit()
 
         hold = s_ok.get(Reservation, rid)
@@ -576,7 +580,7 @@ def test_recover_ambiguous_cannot_overwrite_committed(cx):
             result_json='{"ok":true}',
         )
         assert fin.won
-        assert stale.status == "executing"
+        assert stale.status == "executing"  # identity map still stale
         out = ledger.recover_reserved(s_stale, stale, mode="ambiguous")
         assert out.status == "committed"
     finally:
