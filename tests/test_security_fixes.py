@@ -396,3 +396,51 @@ def test_reserved_still_releasable_if_never_dispatched(seeded):
         assert out.status == "released"
         assert s.query(IdempotencyRecord).filter_by(idempotency_key="never-dispatch").count() == 0
     assert cx.remaining(m.id) == 100
+
+
+def test_finalize_success_refuses_reserved_without_executing(seeded):
+    """Success requires the executing barrier; reserved must not commit a receipt."""
+    from crossing import billing, receipts
+    from crossing.models import Receipt
+
+    cx, p, a, m = seeded
+    with cx.session() as s:
+        mandate = load_live_mandate(s, m.id)
+        res, inv = ledger.reserve_and_commit(
+            s, mandate, 5, idempotency_key="r8-no-exec", tool="search", server="mock"
+        )
+        rid, iid = res.id, inv.id
+        pid, aid, mid = p.id, a.id, m.id
+
+        def receipt_fn(sess):
+            return receipts.issue(
+                sess,
+                principal_id=pid,
+                mandate_id=mid,
+                reservation_id=rid,
+                tool="search",
+                server="mock",
+                amount_cents=5,
+                result={"ok": True},
+                agent_id=aid,
+                outcome="ok",
+            )
+
+        def billing_fn(sess, rec):
+            return billing.enqueue(sess, receipt_id=rec.id, amount_cents=5, principal_id=pid)
+
+        fin = ledger.finalize_success(
+            s,
+            res,
+            inv,
+            receipt_fn=receipt_fn,
+            billing_fn=billing_fn,
+            result_json='{"ok":true}',
+        )
+        assert fin.won is False
+        assert inv.status == "reserved"
+        assert res.status == "held"
+        assert s.query(Receipt).count() == 0
+        claim = s.query(IdempotencyRecord).filter_by(idempotency_key="r8-no-exec").one()
+        assert claim.status == "in_progress"
+    assert cx.remaining(m.id) == 95
