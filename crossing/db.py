@@ -20,7 +20,12 @@ SessionLocal: sessionmaker[Session] | None = None
 
 
 def database_url() -> str:
-    return os.environ.get("DATABASE_URL") or os.environ.get("CROSSING_DATABASE_URL") or DEFAULT_URL
+    raw = os.environ.get("DATABASE_URL") or os.environ.get("CROSSING_DATABASE_URL") or DEFAULT_URL
+    if raw.startswith("postgres://"):
+        raw = "postgresql://" + raw[len("postgres://") :]
+    if raw.startswith("postgresql://"):
+        raw = "postgresql+psycopg://" + raw[len("postgresql://") :]
+    return raw
 
 
 def _is_sqlite(url: str) -> bool:

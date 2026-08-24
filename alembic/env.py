@@ -14,7 +14,21 @@ if config.config_file_name is not None:
 
 target_metadata = Base.metadata
 
-url = os.environ.get("DATABASE_URL") or os.environ.get("CROSSING_DATABASE_URL") or config.get_main_option("sqlalchemy.url")
+
+def _sa_url(raw: str | None) -> str | None:
+    """Render hands postgres://; SQLAlchemy 2 defaults that to psycopg2. We ship psycopg3."""
+    if not raw:
+        return raw
+    if raw.startswith("postgres://"):
+        raw = "postgresql://" + raw[len("postgres://") :]
+    if raw.startswith("postgresql://") and "+" not in raw.split("://", 1)[0]:
+        raw = "postgresql+psycopg://" + raw[len("postgresql://") :]
+    return raw
+
+
+url = _sa_url(
+    os.environ.get("DATABASE_URL") or os.environ.get("CROSSING_DATABASE_URL") or config.get_main_option("sqlalchemy.url")
+)
 
 
 def run_migrations_offline() -> None:
