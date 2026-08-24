@@ -31,6 +31,20 @@ def test_health_and_story(cx):
     assert recs
     one = client.get(f"/v1/receipts/{recs[0]['id']}").json()
     assert one["valid"] is True
-    html = client.get("/").text
+    html = client.get("/", headers={"X-API-Key": "dev"}).text
     assert "principals" in html
     assert "ledger_events" in html
+
+
+def test_dashboard_requires_auth(cx):
+    client = TestClient(app)
+    denied = client.get("/")
+    assert denied.status_code == 401
+    bad = client.get("/?key=wrong")
+    assert bad.status_code == 401
+    ok_header = client.get("/", headers={"X-API-Key": "dev"})
+    assert ok_header.status_code == 200
+    assert "principals" in ok_header.text
+    ok_query = client.get("/?key=dev")
+    assert ok_query.status_code == 200
+    assert "ledger_events" in ok_query.text
