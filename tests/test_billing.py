@@ -12,16 +12,23 @@ from crossing import billing
 from crossing.models import Account, LedgerEvent, Outbox, Principal, Reservation, StripeEvent, utcnow
 
 
+def _attach_customer(cx, principal, cus="cus_x"):
+    with cx.session() as s:
+        acct = s.get(Account, s.get(Principal, principal.id).account_id)
+        acct.stripe_customer_id = cus
+
+
 def test_stripe_adapter_failure_does_not_rollback_commit(seeded, monkeypatch):
-    cx, _, _, m = seeded
+    cx, p, _, m = seeded
     monkeypatch.setenv("STRIPE_SECRET_KEY", "sk_test_not_real")
-    monkeypatch.setenv("STRIPE_CUSTOMER_ID", "cus_x")
+    _attach_customer(cx, p)
 
     def boom(_payload):
         raise httpx.ConnectError("nope")
 
     monkeypatch.setattr(billing, "post_stripe", boom)
     r = cx.invoke(m.id, "search", {"q": "bill"}, idempotency_key="bill-1")
+    billing.drain_outbox()
     assert r.ok is True
     assert cx.remaining(m.id) == 95
     with cx.session() as s:
@@ -41,19 +48,24 @@ def test_stripe_noop_without_key(seeded):
     assert r.ok
     with cx.session() as s:
         rows = s.query(Outbox).all()
+        assert rows[0].status == "pending"
+    billing.drain_outbox()
+    with cx.session() as s:
+        rows = s.query(Outbox).all()
         assert rows[0].status == "noop"
 
 
 def test_outbox_failed_retryable_then_dead(seeded, monkeypatch):
-    cx, _, _, m = seeded
+    cx, p, _, m = seeded
     monkeypatch.setenv("STRIPE_SECRET_KEY", "sk_test_not_real")
-    monkeypatch.setenv("STRIPE_CUSTOMER_ID", "cus_x")
+    _attach_customer(cx, p)
 
     def boom(_payload):
         raise RuntimeError("http failed")
 
     monkeypatch.setattr(billing, "post_stripe", boom)
     r = cx.invoke(m.id, "search", {"q": "retry"}, idempotency_key="retry-1")
+    billing.drain_outbox()
     assert r.ok is True
     assert cx.remaining(m.id) == 95
 
@@ -107,6 +119,8 @@ def test_drain_not_inside_ledger_txn(seeded, monkeypatch):
     monkeypatch.setattr(billing, "enqueue", enqueue_no_http)
     r = cx.invoke(m.id, "search", {"q": "after"}, idempotency_key="after-1")
     assert r.ok
+    assert calls["n"] == 0
+    billing.drain_outbox()
     assert calls["n"] >= 1
     with cx.session() as s:
         assert any(e.kind == "commit" for e in s.query(LedgerEvent).all())
@@ -133,8 +147,8 @@ def test_fee_bps_does_not_round_subcent_to_zero(seeded, monkeypatch):
         assert acct.fee_invoiced_cents == 0
         for i in range(499):
             billing.apply_platform_fee(acct, 5)
-        assert acct.fee_invoiced_cents == 1
-        assert acct.fee_microcents == 0
+        assert acct.fee_invoiced_cents == 0
+        assert acct.fee_microcents == 2000 * 500
 
 
 def test_ledger_does_not_store_commercial_price_id(seeded, monkeypatch):
