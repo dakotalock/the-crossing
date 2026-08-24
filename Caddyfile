@@ -1,0 +1,4 @@
+# Staging example. Put TLS at the edge in production.
+:80 {
+	reverse_proxy api:8000
+}

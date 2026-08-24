@@ -14,11 +14,23 @@ jobs:
           python-version: "3.12"
       - name: Install
         run: pip install -r requirements.txt
+      - name: Ruff
+        run: pip install ruff && ruff check crossing tests alembic
       - name: Pytest
         env:
           CROSSING_ALLOW_DEV: "1"
           CROSSING_KEY_PEPPER: "ci-test-pepper"
         run: pytest -q
+      - name: Docker build
+        run: docker build -t crossing:ci .
+      - name: pip-audit
+        continue-on-error: true
+        run: |
+          if pip install pip-audit; then
+            pip-audit -r requirements.txt
+          else
+            echo "pip-audit skipped (install failed)"
+          fi
 
   postgres:
     runs-on: ubuntu-latest
