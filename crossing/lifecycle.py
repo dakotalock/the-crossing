@@ -11,6 +11,7 @@ from sqlalchemy.orm import Session
 
 from crossing import billing, ledger, mock_mcp, pricing, receipts
 from crossing.identity import create_task
+from crossing.ledger import IdempotencyReplay
 from crossing.mandate import load_live_mandate
 from crossing.models import IdempotencyRecord, Invocation, UsedNonce, new_id
 from crossing.policy import PolicyDenied, Reason, check_tool
@@ -88,6 +89,8 @@ def _load_idem(
     stored = row.request_hash
     if stored and stored != request_hash:
         raise PolicyDenied(Reason.IDEMPOTENCY_CONFLICT, "same key, different request hash")
+    if row.status == "in_progress" or not row.result_json:
+        raise PolicyDenied(Reason.IN_PROGRESS, "wait-or-conflict")
     data = json.loads(row.result_json)
     res = InvokeResult(**{k: data[k] for k in data if k in InvokeResult.__dataclass_fields__})
     res.replayed = True
@@ -161,6 +164,14 @@ def invoke(
     try:
         cached = _load_idem(session, mandate.principal_id, idempotency_key, req_hash)
     except PolicyDenied as exc:
+        if exc.reason == Reason.IN_PROGRESS:
+            return InvokeResult(
+                ok=False,
+                reason=exc.reason,
+                detail=str(exc.detail),
+                remaining_cents=mandate.remaining_cents,
+                idempotency_key=idempotency_key,
+            )
         return _deny(
             session,
             principal_id=mandate.principal_id,
@@ -221,6 +232,11 @@ def invoke(
             request_hash=req_hash,
             task_id=task_id,
         )
+    except IdempotencyReplay as replay:
+        data = json.loads(replay.record.result_json or "{}")
+        res = InvokeResult(**{k: data[k] for k in data if k in InvokeResult.__dataclass_fields__})
+        res.replayed = True
+        return res
     except PolicyDenied as exc:
         return InvokeResult(
             ok=False,
@@ -241,6 +257,16 @@ def invoke(
         invocation.status = "executed_fail"
         ledger.release(session, reservation, task_id=task_id)
         invocation.status = "released"
+        invocation.idempotency_key = None
+        if idempotency_key:
+            claim = session.scalar(
+                select(IdempotencyRecord).where(
+                    IdempotencyRecord.principal_id == mandate.principal_id,
+                    IdempotencyRecord.idempotency_key == idempotency_key,
+                )
+            )
+            if claim is not None and claim.status == "in_progress":
+                session.delete(claim)
         session.flush()
         return InvokeResult(
             ok=False,
@@ -288,15 +314,28 @@ def invoke(
         task_id=task_id,
     )
     if idempotency_key:
-        session.add(
-            IdempotencyRecord(
-                id=new_id(),
-                principal_id=mandate.principal_id,
-                idempotency_key=idempotency_key,
-                request_hash=req_hash,
-                result_json=json.dumps(result.to_dict()),
+        claim = session.scalar(
+            select(IdempotencyRecord).where(
+                IdempotencyRecord.principal_id == mandate.principal_id,
+                IdempotencyRecord.idempotency_key == idempotency_key,
             )
         )
+        payload = json.dumps(result.to_dict())
+        if claim is None:
+            session.add(
+                IdempotencyRecord(
+                    id=new_id(),
+                    principal_id=mandate.principal_id,
+                    idempotency_key=idempotency_key,
+                    request_hash=req_hash,
+                    status="completed",
+                    result_json=payload,
+                )
+            )
+        else:
+            claim.status = "completed"
+            claim.request_hash = req_hash
+            claim.result_json = payload
         session.flush()
     session.commit()
     billing.drain_outbox()
