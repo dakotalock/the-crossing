@@ -3,9 +3,10 @@
 from __future__ import annotations
 
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from crossing.models import Invocation, LedgerEvent, Mandate, Reservation, new_id
+from crossing.models import IdempotencyRecord, Invocation, LedgerEvent, Mandate, Reservation, new_id
 from crossing.policy import PolicyDenied, Reason
 
 
@@ -93,6 +94,55 @@ def reserve(
     return res
 
 
+class IdempotencyReplay(Exception):
+    """Existing completed claim — caller should return the stored result."""
+
+    def __init__(self, record: IdempotencyRecord):
+        self.record = record
+
+
+def _claim_idempotency(
+    session: Session,
+    *,
+    principal_id: str,
+    idempotency_key: str,
+    request_hash: str | None,
+) -> IdempotencyRecord:
+    """Insert durable claim (status=in_progress) or raise replay/conflict/in-progress.
+
+    Must run in the same transaction as reserve. Unique (principal_id, key)
+    is the concurrency gate: losers do not decrement budget.
+    """
+    rec = IdempotencyRecord(
+        id=new_id(),
+        principal_id=principal_id,
+        idempotency_key=idempotency_key,
+        request_hash=request_hash,
+        status="in_progress",
+        result_json=None,
+    )
+    try:
+        with session.begin_nested():
+            session.add(rec)
+            session.flush()
+        return rec
+    except IntegrityError:
+        existing = session.scalar(
+            select(IdempotencyRecord).where(
+                IdempotencyRecord.principal_id == principal_id,
+                IdempotencyRecord.idempotency_key == idempotency_key,
+            )
+        )
+        if existing is None:
+            raise PolicyDenied(Reason.IDEMPOTENCY_CONFLICT, "claim unique violation")
+        stored = existing.request_hash
+        if stored and request_hash and stored != request_hash:
+            raise PolicyDenied(Reason.IDEMPOTENCY_CONFLICT, "same key, different request hash")
+        if existing.status == "completed" and existing.result_json:
+            raise IdempotencyReplay(existing)
+        raise PolicyDenied(Reason.IN_PROGRESS, "wait-or-conflict")
+
+
 def reserve_and_commit(
     session: Session,
     mandate: Mandate,
@@ -105,11 +155,18 @@ def reserve_and_commit(
     request_hash: str | None = None,
     task_id: str | None = None,
 ) -> tuple[Reservation, Invocation]:
-    """Write reservation + decrement remaining, then COMMIT before external execute.
+    """Claim idempotency, write reservation + decrement remaining, COMMIT before execute.
 
     Crash-after-execute-before-commit leaves this reserved Invocation row durable.
     It must not silently roll back the reserve.
     """
+    if idempotency_key:
+        _claim_idempotency(
+            session,
+            principal_id=mandate.principal_id,
+            idempotency_key=idempotency_key,
+            request_hash=request_hash,
+        )
     res = reserve(
         session,
         mandate,
@@ -137,23 +194,25 @@ def reserve_and_commit(
     return res, inv
 
 
-def recover_reserved(session: Session, invocation: Invocation, *, mode: str = "release") -> Invocation:
+def recover_reserved(session: Session, invocation: Invocation, *, mode: str = "ambiguous") -> Invocation:
     """Recover reserved+no-outcome rows.
 
-    Conservative default (`release`): refund remaining and mark released.
-    `ambiguous`: mark ambiguous when the tool side-effect may have occurred
-    (crash after execute, before commit). Operators inspect and resolve.
+    Default mode is ``ambiguous``: mark the row ambiguous and do **not**
+    refund remaining. Operators must inspect ambiguous invocations and
+    only refund when they can prove execute never started.
+
+    Explicit ``mode="release"`` is the only path that refunds remaining.
     """
     if invocation.status != "reserved":
         return invocation
-    if mode == "ambiguous":
-        invocation.status = "ambiguous"
+    if mode == "release":
+        res = session.get(Reservation, invocation.reservation_id) if invocation.reservation_id else None
+        if res is not None:
+            release(session, res, task_id=invocation.task_id)
+        invocation.status = "released"
         session.flush()
         return invocation
-    res = session.get(Reservation, invocation.reservation_id) if invocation.reservation_id else None
-    if res is not None:
-        release(session, res, task_id=invocation.task_id)
-    invocation.status = "released"
+    invocation.status = "ambiguous"
     session.flush()
     return invocation
 
