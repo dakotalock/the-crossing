@@ -183,3 +183,181 @@ def _claim_idempotency(
         if existing.status == "completed" and existing.result_json:
             raise IdempotencyReplay(existing)
         raise PolicyDenied(Reason.IN_PROGRESS, "wait-or-conflict")
+
+
+def reserve_and_commit(
+    session: Session,
+    mandate: Mandate,
+    amount_cents: int,
+    *,
+    idempotency_key: str | None = None,
+    nonce: str | None = None,
+    tool: str = "",
+    server: str = "",
+    request_hash: str | None = None,
+    task_id: str | None = None,
+) -> tuple[Reservation, Invocation]:
+    """Claim + reserve + invocation insert as one savepoint, then COMMIT.
+
+    If reserve fails, the LogicalOperation claim rolls back with the savepoint.
+    Deny events are recorded *outside* that unit so they persist without a
+    poisoned in_progress claim.
+    """
+    try:
+        with session.begin_nested():
+            if idempotency_key:
+                _claim_idempotency(
+                    session,
+                    principal_id=mandate.principal_id,
+                    idempotency_key=idempotency_key,
+                    request_hash=request_hash,
+                )
+            res = reserve(
+                session,
+                mandate,
+                amount_cents,
+                idempotency_key=idempotency_key,
+                nonce=nonce,
+                task_id=task_id,
+                record_deny=False,
+            )
+            inv = Invocation(
+                id=new_id(),
+                principal_id=mandate.principal_id,
+                mandate_id=mandate.id,
+                reservation_id=res.id,
+                task_id=task_id,
+                tool=tool,
+                server=server,
+                request_hash=request_hash,
+                idempotency_key=idempotency_key,
+                amount_cents=amount_cents,
+                status="reserved",
+            )
+            session.add(inv)
+            session.flush()
+    except PolicyDenied as exc:
+        session.refresh(mandate)
+        if exc.reason in (Reason.BUDGET_EXCEEDED, Reason.MAX_CALLS_EXCEEDED):
+            append_event(
+                session,
+                principal_id=mandate.principal_id,
+                mandate_id=mandate.id,
+                kind="deny",
+                amount_cents=amount_cents,
+                remaining_after=mandate.remaining_cents,
+                idempotency_key=idempotency_key,
+                note=exc.reason,
+                task_id=task_id,
+            )
+        raise
+    session.commit()
+    return res, inv
+
+
+def _clear_logical_operation(session: Session, invocation: Invocation) -> None:
+    if not invocation.idempotency_key:
+        return
+    claim = session.scalar(
+        select(IdempotencyRecord).where(
+            IdempotencyRecord.principal_id == invocation.principal_id,
+            IdempotencyRecord.idempotency_key == invocation.idempotency_key,
+        )
+    )
+    if claim is not None:
+        session.delete(claim)
+
+
+def recover_reserved(session: Session, invocation: Invocation, *, mode: str = "ambiguous") -> Invocation:
+    """Recover reserved+no-outcome rows.
+
+    Default mode is ``ambiguous``: mark the row ambiguous and do **not**
+    refund remaining and do **not** clear the LogicalOperation claim.
+    Retry of the same key stays blocked (IN_PROGRESS / wait-or-conflict).
+
+    Explicit ``mode="release"`` refunds remaining, marks the attempt released,
+    and deletes the matching IdempotencyRecord so the same key can be retried
+    as a new ExecutionAttempt. Only use when execute can be proven never to
+    have started.
+    """
+    if invocation.status != "reserved":
+        return invocation
+    if mode == "release":
+        res = session.get(Reservation, invocation.reservation_id) if invocation.reservation_id else None
+        if res is not None:
+            release(session, res, task_id=invocation.task_id)
+        invocation.status = "released"
+        _clear_logical_operation(session, invocation)
+        session.flush()
+        return invocation
+    invocation.status = "ambiguous"
+    session.flush()
+    return invocation
+
+
+def commit(session: Session, reservation: Reservation, *, task_id: str | None = None) -> Reservation:
+    """CAS held -> committed. Loser is a no-op; only the winner writes the event."""
+    row = session.execute(
+        update(Reservation)
+        .where(Reservation.id == reservation.id, Reservation.status == "held")
+        .values(status="committed")
+        .returning(Reservation.id)
+    ).first()
+    if row is None:
+        session.refresh(reservation)
+        return reservation
+    session.refresh(reservation)
+    m = session.get(Mandate, reservation.mandate_id)
+    remaining = m.remaining_cents if m else None
+    append_event(
+        session,
+        principal_id=reservation.principal_id,
+        mandate_id=reservation.mandate_id,
+        kind="commit",
+        amount_cents=reservation.amount_cents,
+        remaining_after=remaining,
+        reservation_id=reservation.id,
+        idempotency_key=reservation.idempotency_key,
+        task_id=task_id,
+    )
+    session.flush()
+    return reservation
+
+
+def release(session: Session, reservation: Reservation, *, task_id: str | None = None) -> Reservation:
+    """CAS held -> released. Only the winner refunds remaining and writes the event."""
+    row = session.execute(
+        update(Reservation)
+        .where(Reservation.id == reservation.id, Reservation.status == "held")
+        .values(status="released")
+        .returning(Reservation.id)
+    ).first()
+    if row is None:
+        session.refresh(reservation)
+        return reservation
+    session.refresh(reservation)
+    refund = session.execute(
+        update(Mandate)
+        .where(Mandate.id == reservation.mandate_id)
+        .values(
+            remaining_cents=Mandate.remaining_cents + reservation.amount_cents,
+            calls_used=case((Mandate.calls_used > 0, Mandate.calls_used - 1), else_=0),
+        )
+        .returning(Mandate.remaining_cents)
+    ).first()
+    remaining = int(refund[0]) if refund is not None else None
+    if remaining is not None:
+        session.refresh(session.get(Mandate, reservation.mandate_id))
+    append_event(
+        session,
+        principal_id=reservation.principal_id,
+        mandate_id=reservation.mandate_id,
+        kind="release",
+        amount_cents=reservation.amount_cents,
+        remaining_after=remaining,
+        reservation_id=reservation.id,
+        idempotency_key=reservation.idempotency_key,
+        task_id=task_id,
+    )
+    session.flush()
+    return reservation
