@@ -42,7 +42,7 @@ def main(argv: list[str] | None = None) -> int:
         metavar="OUTBOX_ID",
         nargs="?",
         const="*",
-        help="admin: requeue dead outbox row(s) to pending (omit id for all)",
+        help="admin: requeue dead outbox to pending with attempts=0 (omit id for all)",
     )
     args = parser.parse_args(argv)
     if os.environ.get("CROSSING_ALLOW_DEV") != "1":
