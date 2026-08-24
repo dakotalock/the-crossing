@@ -5,7 +5,7 @@ import secrets
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.orm import Session
 
 from crossing import crypto
@@ -210,7 +210,22 @@ def issue_mandate(
     session.flush()
 
     if parent is not None:
-        parent.remaining_cents -= spend_limit_cents
+        escrowed = session.execute(
+            update(Mandate)
+            .where(
+                Mandate.id == parent.id,
+                Mandate.remaining_cents >= spend_limit_cents,
+                Mandate.revoked.is_(False),
+            )
+            .values(remaining_cents=Mandate.remaining_cents - spend_limit_cents)
+            .returning(Mandate.remaining_cents)
+        ).first()
+        if escrowed is None:
+            raise PolicyDenied(
+                Reason.CHILD_SPEND_ESCALATION,
+                f"{spend_limit_cents} > remaining",
+            )
+        session.refresh(parent)
         session.add(
             LedgerEvent(
                 id=new_id(),

@@ -20,7 +20,7 @@ SessionLocal: sessionmaker[Session] | None = None
 
 
 def database_url() -> str:
-    return os.environ.get("DATABASE_URL") or DEFAULT_URL
+    return os.environ.get("DATABASE_URL") or os.environ.get("CROSSING_DATABASE_URL") or DEFAULT_URL
 
 
 def _is_sqlite(url: str) -> bool:
@@ -34,8 +34,12 @@ def make_engine(url: str | None = None) -> Engine:
         kwargs["connect_args"] = {"check_same_thread": False, "timeout": 15.0}
         if ":memory:" in url:
             kwargs["poolclass"] = StaticPool
+    if not _is_sqlite(url):
+        kwargs.setdefault("pool_pre_ping", True)
     engine = create_engine(url, **kwargs)
 
+    # BEGIN IMMEDIATE is SQLite-only. Postgres uses default isolation;
+    # scarce-authority gates are conditional UPDATE ... RETURNING.
     if _is_sqlite(url):
 
         @event.listens_for(engine, "connect")
