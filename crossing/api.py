@@ -11,13 +11,15 @@ from typing import Any
 from fastapi import Cookie, Depends, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Response
+from fastapi.staticfiles import StaticFiles
+from pathlib import Path
 from pydantic import BaseModel, Field
 from sqlalchemy import text
 from starlette.types import ASGIApp, Receive, Scope, Send
 
 from crossing import abuse, auth, crypto, db, ledger, logging_json, metrics
 from crossing.auth import AuthContext, SESSION_COOKIE
-from crossing.dashboard import render
+from crossing.dashboard import landing, render
 from crossing.identity import create_agent, create_principal, revoke_agent
 from crossing.lifecycle import invoke
 from crossing.mandate import issue_mandate, revoke_mandate
@@ -267,6 +269,11 @@ def get_metrics(request: Request) -> Response:
 
 
 @app.get("/", response_class=HTMLResponse)
+def public_landing() -> str:
+    return landing()
+
+
+@app.get("/dashboard", response_class=HTMLResponse)
 def dashboard(
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
     crossing_session: str | None = Cookie(default=None, alias=SESSION_COOKIE),
@@ -653,7 +660,6 @@ def post_admin_stripe_customer(
             raise _forbidden()
         try:
             acct = billing.attach_stripe_customer(s, account_id, body.stripe_customer_id)
-        except PolicyDenied as exc:
             raise HTTPException(status_code=409, detail={"reason": exc.reason, "detail": exc.detail}) from exc
         return {
             "account_id": acct.id,
@@ -689,3 +695,7 @@ def get_billing_status(ctx: AuthContext = Depends(require_scope("billing:read"))
 
     with db.session_scope() as s:
         return billing.billing_status(s, ctx.account_id)
+
+_STATIC = Path(__file__).resolve().parent / "static"
+if _STATIC.is_dir():
+    app.mount("/static", StaticFiles(directory=str(_STATIC)), name="static")
