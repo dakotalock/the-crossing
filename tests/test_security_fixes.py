@@ -6,7 +6,7 @@ from fastapi.testclient import TestClient
 from crossing import billing, crypto, db, ledger
 from crossing.api import app
 from crossing.mandate import load_live_mandate
-from crossing.models import Invocation, LedgerEvent, Mandate, Outbox, Reservation
+from crossing.models import IdempotencyRecord, Invocation, LedgerEvent, Mandate, Outbox, Reservation
 from crossing.policy import PolicyDenied, Reason
 
 
@@ -190,6 +190,14 @@ def test_recover_reserved_default_ambiguous_does_not_refund(seeded):
         assert s.get(MandateModel, m.id).remaining_cents == 95
         held = s.query(Reservation).all()
         assert any(h.status == "held" for h in held)
+        claim = s.query(IdempotencyRecord).filter_by(idempotency_key="amb-1").one_or_none()
+        assert claim is not None
+        assert claim.status == "in_progress"
+    retry = cx.invoke(m.id, "search", {"q": "after-amb"}, idempotency_key="amb-1")
+    assert retry.ok is False
+    assert retry.reason == Reason.IN_PROGRESS
+    assert retry.replayed is False
+    assert cx.remaining(m.id) == 95
 
 
 def test_recover_reserved_release_refunds_only_when_explicit(seeded):
@@ -205,3 +213,61 @@ def test_recover_reserved_release_refunds_only_when_explicit(seeded):
         out = ledger.recover_reserved(s, inv, mode="release")
         assert out.status == "released"
     assert cx.remaining(m.id) == 100
+
+
+def test_budget_deny_does_not_poison_idempotency_key(seeded):
+    """reserve fail must not leave a LogicalOperation claim in_progress."""
+    cx, _, _, m = seeded
+    with cx.session() as s:
+        s.get(Mandate, m.id).remaining_cents = 0
+    with cx.session() as s:
+        mandate = load_live_mandate(s, m.id)
+        with pytest.raises(PolicyDenied) as ei:
+            ledger.reserve_and_commit(
+                s, mandate, 5, idempotency_key="poison-key", tool="search", server="mock"
+            )
+        assert ei.value.reason == Reason.BUDGET_EXCEEDED
+    with cx.session() as s:
+        claims = s.query(IdempotencyRecord).filter_by(idempotency_key="poison-key").all()
+        assert claims == []
+        assert not any(c.status == "in_progress" for c in s.query(IdempotencyRecord).all())
+        s.get(Mandate, m.id).remaining_cents = 100
+    second = cx.invoke(m.id, "search", {"q": "funded"}, idempotency_key="poison-key")
+    assert second.ok
+    assert second.replayed is False
+
+
+def test_recover_reserved_release_allows_retry_same_key(seeded):
+    cx, _, _, m = seeded
+    with cx.session() as s:
+        mandate = load_live_mandate(s, m.id)
+        _res, inv = ledger.reserve_and_commit(
+            s, mandate, 5, idempotency_key="rel-retry", tool="search", server="mock"
+        )
+        inv_id = inv.id
+    with cx.session() as s:
+        out = ledger.recover_reserved(s, s.get(Invocation, inv_id), mode="release")
+        assert out.status == "released"
+        assert s.query(IdempotencyRecord).filter_by(idempotency_key="rel-retry").count() == 0
+    assert cx.remaining(m.id) == 100
+    second = cx.invoke(m.id, "search", {"q": "retry"}, idempotency_key="rel-retry")
+    assert second.ok
+    assert second.replayed is False
+    with cx.session() as s:
+        attempts = s.query(Invocation).filter_by(idempotency_key="rel-retry").all()
+        assert len(attempts) == 2
+        statuses = {i.status for i in attempts}
+        assert "released" in statuses
+        assert "committed" in statuses
+
+
+def test_atomic_debit_refuses_overspend(seeded):
+    cx, _, _, m = seeded
+    with cx.session() as s:
+        mandate = load_live_mandate(s, m.id)
+        with pytest.raises(PolicyDenied) as ei:
+            ledger.reserve(s, mandate, 101)
+        assert ei.value.reason == Reason.BUDGET_EXCEEDED
+        s.refresh(mandate)
+        assert mandate.remaining_cents == 100
+        assert mandate.calls_used == 0
