@@ -166,3 +166,42 @@ def test_api_unauthenticated_mint_forbidden_without_dev(cx, monkeypatch):
     assert ok.status_code == 200
     monkeypatch.setenv("CROSSING_ALLOW_DEV", "1")
     crypto.reset_for_tests()
+
+
+
+def test_recover_reserved_default_ambiguous_does_not_refund(seeded):
+    cx, _, _, m = seeded
+    with cx.session() as s:
+        mandate = load_live_mandate(s, m.id)
+        _res, inv = ledger.reserve_and_commit(
+            s, mandate, 5, idempotency_key="amb-1", tool="search", server="mock"
+        )
+        inv_id = inv.id
+    assert cx.remaining(m.id) == 95
+    with cx.session() as s:
+        inv = s.get(Invocation, inv_id)
+        out = ledger.recover_reserved(s, inv)
+        assert out.status == "ambiguous"
+    from crossing.models import Mandate as MandateModel
+
+    with cx.session() as s:
+        inv = s.get(Invocation, inv_id)
+        assert inv.status == "ambiguous"
+        assert s.get(MandateModel, m.id).remaining_cents == 95
+        held = s.query(Reservation).all()
+        assert any(h.status == "held" for h in held)
+
+
+def test_recover_reserved_release_refunds_only_when_explicit(seeded):
+    cx, _, _, m = seeded
+    with cx.session() as s:
+        mandate = load_live_mandate(s, m.id)
+        _res, inv = ledger.reserve_and_commit(
+            s, mandate, 5, idempotency_key="rel-1", tool="search", server="mock"
+        )
+        inv_id = inv.id
+    with cx.session() as s:
+        inv = s.get(Invocation, inv_id)
+        out = ledger.recover_reserved(s, inv, mode="release")
+        assert out.status == "released"
+    assert cx.remaining(m.id) == 100

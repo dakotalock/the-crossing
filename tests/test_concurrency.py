@@ -27,6 +27,7 @@ def test_ten_threads_cannot_overspend(cx):
         )
         mid, pid = m.id, p.id
 
+    # Monkeypatch price for this test via mock + pricing
     from crossing import pricing
 
     pricing.PRICES_CENTS[("mock", "search")] = 20
@@ -47,7 +48,7 @@ def test_ten_threads_cannot_overspend(cx):
             session.commit()
             with lock:
                 results.append(r)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             session.rollback()
             with lock:
                 results.append(exc)
@@ -122,7 +123,7 @@ def test_same_idempotency_key_one_execution(cx):
             session.commit()
             with lock:
                 results.append(r)
-        except Exception as exc:
+        except Exception as exc:  # noqa: BLE001
             session.rollback()
             with lock:
                 results.append(exc)
@@ -148,6 +149,7 @@ def test_same_idempotency_key_one_execution(cx):
         assert len(holds) == 1
         claims = s.query(IdempotencyRecord).all()
         assert len(claims) == 1
+    # loser is in-progress, replay, or a wait-or-conflict deny — not a second execute
     if others:
         o = others[0]
         if getattr(o, "ok", None) is False:
