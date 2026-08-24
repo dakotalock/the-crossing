@@ -74,6 +74,7 @@ In scope (enforced in-process):
 | Billing side effects | True outbox: Stripe only in `drain_outbox()` after COMMIT |
 | Tool blast radius | Mandate tools/servers allow-lists; purchase ($5) denied when only search is granted |
 | Unauthenticated mint | `X-API-Key` header only (no `?key=`); required when `CROSSING_ALLOW_DEV` is off; dashboard always requires the header |
+| Provider SSRF | Operator `CROSSING_PROVIDER_URLS` allowlist; deny private/link-local/metadata; no customer URLs; no shell transport |
 
 Out of scope for this MVP:
 
@@ -86,7 +87,10 @@ Out of scope for this MVP:
 
 ## HTTP
 
-- `GET /health`
+- `GET /health` `GET /healthz` (liveness)
+- `GET /readyz` (readiness; checks DB)
+- `GET /metrics` (prometheus text; `?format=json` for counters: invokes, denials by reason, outbox backlog)
+- `GET /v1/account`
 - `GET /` dashboard (plain HTML tables; `X-API-Key` header required, not `?key=`)
 - `POST/GET /v1/principals`
 - `POST/GET /v1/agents` and `POST /v1/agents/{id}/revoke`
@@ -102,9 +106,11 @@ Out of scope for this MVP:
 
 ## Receipts
 
-Default receipt body is hashes only (`request_hash`, `response_hash`) plus `agent_id`, `task_id`, `mandate_id`, `tool`, `server`, `amount_cents`, `outcome`, `reservation_id`. Full tool results are stored only when `CROSSING_RETAIN_PAYLOADS=1`. `task_id` is wired through ledger events and receipts.
+Default receipt body is hashes only (`request_hash`, `response_hash`) plus `agent_id`, `task_id`, `mandate_id`, `tool`, `server`, `amount_cents`, `outcome`, `reservation_id`, and `kid` (signing key version). Full tool results are stored only when `CROSSING_RETAIN_PAYLOADS=1`. `task_id` is wired through ledger events and receipts. Production signing still refuses ephemeral keys unless `CROSSING_ALLOW_DEV=1`. Default store is env seed; production recommendation is HSM/KMS (`CROSSING_KEY_BACKEND=hsm` fails closed until wired).
 
 ## SDK
+
+In-process and HTTP `/v1` (`crossing.sdk.CrossingClient`): authenticate, account, create agent, issue mandate, invoke with idempotency key, get/verify receipt, remaining budget, billing status. Five-minute path: `docs/quickstart.md`.
 
 ```python
 from crossing.sdk import Crossing
@@ -115,9 +121,14 @@ m = cx.issue_mandate(p.id, a.id, 100, tools=["search"], servers=["mock"])
 print(cx.quote("search"))  # 5 cents
 r = cx.invoke(m.id, "search", {"q": "hi"}, idempotency_key="k1")
 assert r.ok and cx.verify_receipt(r.receipt)
+assert r.receipt["body"]["kid"]
 ```
 
-Crossing forwards a stable `invocation_id` and the `idempotency_key` into `mock_mcp.call_tool`. That is a hint for a provider that can honor it. Crossing still only guarantees at-most-one dispatch from Crossing, not exactly-once at the vendor.
+## Providers
+
+`mock` stays in-process for tests (`crossing.mock_mcp`). Other servers must be named in operator env `CROSSING_PROVIDER_URLS` (never a customer-supplied URL). Transport is MCP HTTP JSON-RPC with `invocation_id` + `idempotency_key` forwarded, timeouts, and capability flags (`supports_idempotency`, `supports_status_query`). SSRF: loopback, RFC1918, link-local, and cloud metadata are denied unless `CROSSING_PROVIDER_INTERNAL_ALLOWLIST=1` *and* the URL is still allowlisted. Provider tokens: `CROSSING_PROVIDER_TOKEN_<NAME>` from env, never receipts or logs. Customers cannot configure a server-side shell.
+
+Crossing still only guarantees at-most-one dispatch from Crossing, not exactly-once at the vendor.
 
 ## Pricing (mock MCP)
 
@@ -145,7 +156,9 @@ The mandate debit, child escrow, and reservation terminal transitions are condit
 - Dev (`CROSSING_ALLOW_DEV=1`): sqlite may `create_all` **or** `alembic upgrade head`. `create_all` runs only when required tables are missing (so an Alembic-applied postgres DB is not rewritten).
 - Production (`CROSSING_ALLOW_DEV!=1`): **do not** `create_all`. Apply migrations before boot (`alembic upgrade head`). API/worker refuse to start if required tables are missing.
 
-CI: `sqlite` job (`CROSSING_ALLOW_DEV=1`, `CROSSING_KEY_PEPPER` set) and `postgres` job (empty DB → `alembic upgrade head` → pytest, no `create_all`).
+CI: `sqlite` job (`CROSSING_ALLOW_DEV=1`, `CROSSING_KEY_PEPPER` set) and `postgres` job (empty DB → `alembic upgrade head` → pytest, no `create_all`). Sqlite job also runs `ruff check`, `docker build` (no registry push), and `pip-audit` when that extra installs; if `pip-audit` cannot install, CI continues and this note is the skip record.
+
+Deploy files: `Dockerfile` (API), `Dockerfile.worker` (same layout, worker CMD), `docker-compose.yml` (postgres / api / worker / optional caddy), `Caddyfile`, `.env.example` (names only). Ops: `docs/deploy.md`, `docs/runbook.md`. JSON logs (stdlib) carry `request_id` / `invocation_id` and not payloads. Rate limit is in-memory per API key (single instance; not multi-host).
 
 `alembic/env.py` reads `DATABASE_URL` the same way as `crossing/db.py`.
 
