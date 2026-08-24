@@ -4,13 +4,14 @@ from __future__ import annotations
 
 import json
 import os
+from datetime import timedelta
 from typing import Any
 
 import httpx
-from sqlalchemy import select
+from sqlalchemy import and_, or_, select, update
 from sqlalchemy.orm import Session
 
-from crossing.models import Outbox, new_id
+from crossing.models import Outbox, new_id, utcnow
 
 STRIPE_API = "https://api.stripe.com/v1"
 
@@ -75,6 +76,24 @@ def post_stripe(payload: dict[str, Any]) -> dict[str, Any]:
     return {"ok": True, "stripe_reported": True}
 
 
+MAX_ATTEMPTS = 8
+
+
+def backoff_minutes(attempts: int) -> int:
+    """1, 2, 4, 8, ... minutes, cap 60."""
+    n = max(1, int(attempts))
+    return min(60, 2 ** (n - 1))
+
+
+def _mark_fail(row: Outbox, error: str) -> None:
+    row.last_error = error
+    if row.attempts >= MAX_ATTEMPTS:
+        row.status = "dead"
+    else:
+        row.status = "failed"
+        row.next_attempt_at = utcnow() + timedelta(minutes=backoff_minutes(row.attempts))
+
+
 def flush_row(session: Session, row: Outbox) -> Outbox:
     payload = json.loads(row.payload_json)
     row.attempts += 1
@@ -87,13 +106,45 @@ def flush_row(session: Session, row: Outbox) -> Outbox:
             row.status = "sent"
             row.last_error = None
         else:
-            row.status = "failed"
-            row.last_error = str(result.get("error") or "stripe failed")
+            _mark_fail(row, str(result.get("error") or "stripe failed"))
     except Exception as exc:  # noqa: BLE001 — adapter must never raise into commit
-        row.status = "failed"
-        row.last_error = exc.__class__.__name__
+        _mark_fail(row, exc.__class__.__name__)
     session.flush()
     return row
+
+
+def _claim_outbox_rows(session: Session, *, limit: int) -> list[Outbox]:
+    """Atomically claim pending/retryable rows (status -> sending)."""
+    now = utcnow()
+    ids = list(
+        session.scalars(
+            select(Outbox.id).where(
+                or_(
+                    Outbox.status == "pending",
+                    and_(
+                        Outbox.status == "failed",
+                        Outbox.next_attempt_at.is_not(None),
+                        Outbox.next_attempt_at <= now,
+                        Outbox.attempts < MAX_ATTEMPTS,
+                    ),
+                )
+            ).limit(limit)
+        ).all()
+    )
+    claimed: list[Outbox] = []
+    for oid in ids:
+        result = session.execute(
+            update(Outbox)
+            .where(Outbox.id == oid, Outbox.status.in_(("pending", "failed")))
+            .values(status="sending")
+        )
+        if result.rowcount == 1:
+            session.expire_all()
+            row = session.get(Outbox, oid)
+            if row is not None:
+                claimed.append(row)
+    session.flush()
+    return claimed
 
 
 def report_after_commit(session: Session, row: Outbox) -> Outbox:
@@ -113,9 +164,7 @@ def drain_outbox(session: Session | None = None, *, limit: int = 50) -> list[Out
         session = db.get_session()
     assert session is not None
     try:
-        rows = list(
-            session.scalars(select(Outbox).where(Outbox.status == "pending").limit(limit)).all()
-        )
+        rows = _claim_outbox_rows(session, limit=limit)
         for row in rows:
             flush_row(session, row)
         session.commit()
