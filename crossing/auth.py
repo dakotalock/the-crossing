@@ -19,13 +19,14 @@ from crossing.policy import PolicyDenied, Reason
 
 SCOPES = (
     "read",
+    "write",
     "invoke",
     "mandate:issue",
     "mandate:revoke",
     "billing:read",
     "admin",
 )
-CUSTOMER_SCOPES = ("read", "invoke", "mandate:issue", "mandate:revoke", "billing:read")
+CUSTOMER_SCOPES = ("read", "write", "invoke", "mandate:issue", "mandate:revoke", "billing:read")
 ADMIN_SCOPES = SCOPES
 BOOTSTRAP_PREFIX = "cxk_test_boot"
 BOOTSTRAP_SECRET = "dev"  # raw secret only in ALLOW_DEV bootstrap; never stored
