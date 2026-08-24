@@ -1,4 +1,4 @@
-"""quote / authorize / reserve_and_commit / execute / commit / release."""
+"""quote / authorize / reserve_and_commit / execute / finalize_success | finalize_release."""
 
 from __future__ import annotations
 
@@ -13,7 +13,7 @@ from crossing import billing, ledger, mock_mcp, pricing, receipts
 from crossing.identity import create_task
 from crossing.ledger import IdempotencyReplay
 from crossing.mandate import load_live_mandate
-from crossing.models import IdempotencyRecord, Invocation, UsedNonce, new_id
+from crossing.models import IdempotencyRecord, UsedNonce, new_id
 from crossing.policy import PolicyDenied, Reason, check_tool
 from crossing.receipts import payload_hash
 
@@ -256,23 +256,15 @@ def invoke(
             invocation_id=invocation.id,
             idempotency_key=idempotency_key,
         )
-        invocation.status = "executed_ok"
-        session.flush()
-    except Exception as exc:  # MCP failure releases the hold
+    except Exception as exc:  # MCP failure: terminal release owns refund + claim
         invocation.status = "executed_fail"
-        ledger.release(session, reservation, task_id=task_id)
-        invocation.status = "released"
-        invocation.idempotency_key = None
-        if idempotency_key:
-            claim = session.scalar(
-                select(IdempotencyRecord).where(
-                    IdempotencyRecord.principal_id == mandate.principal_id,
-                    IdempotencyRecord.idempotency_key == idempotency_key,
-                )
-            )
-            if claim is not None and claim.status == "in_progress":
-                session.delete(claim)
         session.flush()
+        ledger.finalize_release(
+            session,
+            invocation,
+            reservation,
+            allowed_statuses=("reserved", "executed_fail"),
+        )
         return InvokeResult(
             ok=False,
             reason="MCP_ERROR",
@@ -284,64 +276,75 @@ def invoke(
             task_id=task_id,
         )
 
-    rec = receipts.issue(
-        session,
-        principal_id=mandate.principal_id,
-        mandate_id=mandate.id,
-        reservation_id=reservation.id,
-        tool=tool,
-        server=server,
-        amount_cents=price,
-        result=tool_result,
-        agent_id=mandate.agent_id,
-        task_id=task_id,
-        request_hash=req_hash,
-        outcome="ok",
-    )
-    ledger.commit(session, reservation, task_id=task_id)
-    billing.enqueue(
-        session,
-        receipt_id=rec.id,
-        amount_cents=price,
-        principal_id=mandate.principal_id,
-    )
-    invocation.status = "committed"
-    session.flush()
+    def _issue_receipt(s):
+        return receipts.issue(
+            s,
+            principal_id=mandate.principal_id,
+            mandate_id=mandate.id,
+            reservation_id=reservation.id,
+            tool=tool,
+            server=server,
+            amount_cents=price,
+            result=tool_result,
+            agent_id=mandate.agent_id,
+            task_id=task_id,
+            request_hash=req_hash,
+            outcome="ok",
+        )
 
+    def _enqueue_billing(s, rec):
+        return billing.enqueue(
+            s,
+            receipt_id=rec.id,
+            amount_cents=price,
+            principal_id=mandate.principal_id,
+        )
+
+    remaining_now = session.get(type(mandate), mandate.id).remaining_cents
+
+    def _result_payload(rec):
+        built = InvokeResult(
+            ok=True,
+            amount_cents=price,
+            remaining_cents=remaining_now,
+            receipt=receipts.to_dict(rec) if rec is not None else None,
+            result=tool_result,
+            reservation_id=reservation.id,
+            idempotency_key=idempotency_key,
+            task_id=task_id,
+        )
+        return json.dumps(built.to_dict())
+
+    fin = ledger.finalize_success(
+        session,
+        reservation,
+        invocation,
+        receipt_fn=_issue_receipt,
+        billing_fn=_enqueue_billing,
+        result_fn=_result_payload,
+    )
+    if not fin.won:
+        return InvokeResult(
+            ok=False,
+            reason="FINALIZE_LOST",
+            detail="terminal transition lost",
+            amount_cents=price,
+            remaining_cents=session.get(type(mandate), mandate.id).remaining_cents if mandate else None,
+            reservation_id=reservation.id,
+            idempotency_key=idempotency_key,
+            task_id=task_id,
+        )
+
+    rec = fin.receipt
     result = InvokeResult(
         ok=True,
         amount_cents=price,
         remaining_cents=session.get(type(mandate), mandate.id).remaining_cents,
-        receipt=receipts.to_dict(rec),
+        receipt=receipts.to_dict(rec) if rec is not None else None,
         result=tool_result,
         reservation_id=reservation.id,
         idempotency_key=idempotency_key,
         task_id=task_id,
     )
-    if idempotency_key:
-        claim = session.scalar(
-            select(IdempotencyRecord).where(
-                IdempotencyRecord.principal_id == mandate.principal_id,
-                IdempotencyRecord.idempotency_key == idempotency_key,
-            )
-        )
-        payload = json.dumps(result.to_dict())
-        if claim is None:
-            session.add(
-                IdempotencyRecord(
-                    id=new_id(),
-                    principal_id=mandate.principal_id,
-                    idempotency_key=idempotency_key,
-                    request_hash=req_hash,
-                    status="completed",
-                    result_json=payload,
-                )
-            )
-        else:
-            claim.status = "completed"
-            claim.request_hash = req_hash
-            claim.result_json = payload
-        session.flush()
-    session.commit()
     billing.drain_outbox()
     return result
