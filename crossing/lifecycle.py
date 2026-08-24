@@ -1,4 +1,4 @@
-"""quote / authorize / reserve / execute / commit / release."""
+"""quote / authorize / reserve_and_commit / execute / commit / release."""
 
 from __future__ import annotations
 
@@ -12,8 +12,9 @@ from sqlalchemy.orm import Session
 from crossing import billing, ledger, mock_mcp, pricing, receipts
 from crossing.identity import create_task
 from crossing.mandate import load_live_mandate
-from crossing.models import IdempotencyRecord, UsedNonce, new_id
+from crossing.models import IdempotencyRecord, Invocation, UsedNonce, new_id
 from crossing.policy import PolicyDenied, Reason, check_tool
+from crossing.receipts import payload_hash
 
 
 @dataclass
@@ -28,6 +29,7 @@ class InvokeResult:
     reservation_id: str | None = None
     idempotency_key: str | None = None
     replayed: bool = False
+    task_id: str | None = None
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -41,7 +43,19 @@ class InvokeResult:
             "reservation_id": self.reservation_id,
             "idempotency_key": self.idempotency_key,
             "replayed": self.replayed,
+            "task_id": self.task_id,
         }
+
+
+def request_fingerprint(mandate_id: str, server: str, tool: str, arguments: dict[str, Any] | None) -> str:
+    return payload_hash(
+        {
+            "mandate_id": mandate_id,
+            "server": server,
+            "tool": tool,
+            "arguments": arguments or {},
+        }
+    )
 
 
 def quote(tool: str, server: str = pricing.DEFAULT_SERVER) -> int:
@@ -58,7 +72,9 @@ def authorize(session: Session, mandate_id: str, tool: str, server: str = pricin
     return mandate, price
 
 
-def _load_idem(session: Session, principal_id: str, key: str | None) -> InvokeResult | None:
+def _load_idem(
+    session: Session, principal_id: str, key: str | None, request_hash: str
+) -> InvokeResult | None:
     if not key:
         return None
     row = session.scalar(
@@ -69,10 +85,48 @@ def _load_idem(session: Session, principal_id: str, key: str | None) -> InvokeRe
     )
     if row is None:
         return None
+    stored = row.request_hash
+    if stored and stored != request_hash:
+        raise PolicyDenied(Reason.IDEMPOTENCY_CONFLICT, "same key, different request hash")
     data = json.loads(row.result_json)
     res = InvokeResult(**{k: data[k] for k in data if k in InvokeResult.__dataclass_fields__})
     res.replayed = True
     return res
+
+
+def _deny(
+    session: Session,
+    *,
+    principal_id: str | None,
+    mandate_id: str,
+    reason: str,
+    detail: str = "",
+    remaining: int | None = None,
+    amount: int = 0,
+    idempotency_key: str | None = None,
+    task_id: str | None = None,
+) -> InvokeResult:
+    if principal_id:
+        ledger.append_event(
+            session,
+            principal_id=principal_id,
+            mandate_id=mandate_id,
+            kind="deny",
+            amount_cents=amount,
+            remaining_after=remaining,
+            note=reason,
+            idempotency_key=idempotency_key,
+            task_id=task_id,
+        )
+    return InvokeResult(
+        ok=False,
+        reason=reason,
+        detail=detail,
+        amount_cents=amount,
+        remaining_cents=remaining,
+        idempotency_key=idempotency_key,
+        task_id=task_id,
+    )
 
 
 def invoke(
@@ -85,13 +139,37 @@ def invoke(
     idempotency_key: str | None = None,
     nonce: str | None = None,
     task_name: str | None = None,
+    task_id: str | None = None,
 ) -> InvokeResult:
+    req_hash = request_fingerprint(mandate_id, server, tool, arguments)
+    from crossing.models import Mandate
+
     try:
         mandate = load_live_mandate(session, mandate_id)
     except PolicyDenied as exc:
-        return InvokeResult(ok=False, reason=exc.reason, detail=str(exc.detail))
+        m = session.get(Mandate, mandate_id)
+        return _deny(
+            session,
+            principal_id=m.principal_id if m else None,
+            mandate_id=mandate_id,
+            reason=exc.reason,
+            detail=str(exc.detail),
+            remaining=m.remaining_cents if m else None,
+            idempotency_key=idempotency_key,
+        )
 
-    cached = _load_idem(session, mandate.principal_id, idempotency_key)
+    try:
+        cached = _load_idem(session, mandate.principal_id, idempotency_key, req_hash)
+    except PolicyDenied as exc:
+        return _deny(
+            session,
+            principal_id=mandate.principal_id,
+            mandate_id=mandate.id,
+            reason=exc.reason,
+            detail=str(exc.detail),
+            remaining=mandate.remaining_cents,
+            idempotency_key=idempotency_key,
+        )
     if cached is not None:
         return cached
 
@@ -100,47 +178,48 @@ def invoke(
             select(UsedNonce).where(UsedNonce.principal_id == mandate.principal_id, UsedNonce.nonce == nonce)
         )
         if clash is not None:
-            ledger.append_event(
+            return _deny(
                 session,
                 principal_id=mandate.principal_id,
                 mandate_id=mandate.id,
-                kind="deny",
-                note=Reason.NONCE_REPLAY,
+                reason=Reason.NONCE_REPLAY,
+                detail=nonce,
+                remaining=mandate.remaining_cents,
+                idempotency_key=idempotency_key,
             )
-            return InvokeResult(ok=False, reason=Reason.NONCE_REPLAY, detail=nonce)
 
     try:
         price = quote(tool, server)
         check_tool(mandate, tool, server, price)
     except PolicyDenied as exc:
-        ledger.append_event(
+        return _deny(
             session,
             principal_id=mandate.principal_id,
             mandate_id=mandate.id,
-            kind="deny",
-            amount_cents=0,
-            remaining_after=mandate.remaining_cents,
-            note=exc.reason,
-            idempotency_key=idempotency_key,
-        )
-        return InvokeResult(
-            ok=False,
             reason=exc.reason,
             detail=str(exc.detail),
-            remaining_cents=mandate.remaining_cents,
+            remaining=mandate.remaining_cents,
             idempotency_key=idempotency_key,
         )
 
     if nonce:
         session.add(UsedNonce(id=new_id(), principal_id=mandate.principal_id, nonce=nonce))
 
-    if task_name:
-        create_task(session, mandate.principal_id, mandate.agent_id, task_name)
+    if task_id is None:
+        task = create_task(session, mandate.principal_id, mandate.agent_id, task_name or "invoke")
+        task_id = task.id
 
-    reservation = None
     try:
-        reservation = ledger.reserve(
-            session, mandate, price, idempotency_key=idempotency_key, nonce=nonce
+        reservation, invocation = ledger.reserve_and_commit(
+            session,
+            mandate,
+            price,
+            idempotency_key=idempotency_key,
+            nonce=nonce,
+            tool=tool,
+            server=server,
+            request_hash=req_hash,
+            task_id=task_id,
         )
     except PolicyDenied as exc:
         return InvokeResult(
@@ -150,12 +229,19 @@ def invoke(
             amount_cents=price,
             remaining_cents=mandate.remaining_cents,
             idempotency_key=idempotency_key,
+            task_id=task_id,
         )
 
+    # External execute is outside the reserve transaction (already committed).
     try:
         tool_result = mock_mcp.call_tool(tool, arguments or {})
-    except Exception as exc:
-        ledger.release(session, reservation)
+        invocation.status = "executed_ok"
+        session.flush()
+    except Exception as exc:  # MCP failure releases the hold
+        invocation.status = "executed_fail"
+        ledger.release(session, reservation, task_id=task_id)
+        invocation.status = "released"
+        session.flush()
         return InvokeResult(
             ok=False,
             reason="MCP_ERROR",
@@ -164,6 +250,7 @@ def invoke(
             remaining_cents=session.get(type(mandate), mandate.id).remaining_cents if mandate else None,
             reservation_id=reservation.id,
             idempotency_key=idempotency_key,
+            task_id=task_id,
         )
 
     rec = receipts.issue(
@@ -175,15 +262,20 @@ def invoke(
         server=server,
         amount_cents=price,
         result=tool_result,
+        agent_id=mandate.agent_id,
+        task_id=task_id,
+        request_hash=req_hash,
+        outcome="ok",
     )
-    ledger.commit(session, reservation)
-    row = billing.enqueue(
+    ledger.commit(session, reservation, task_id=task_id)
+    billing.enqueue(
         session,
         receipt_id=rec.id,
         amount_cents=price,
         principal_id=mandate.principal_id,
     )
-    billing.report_after_commit(session, row)
+    invocation.status = "committed"
+    session.flush()
 
     result = InvokeResult(
         ok=True,
@@ -193,6 +285,7 @@ def invoke(
         result=tool_result,
         reservation_id=reservation.id,
         idempotency_key=idempotency_key,
+        task_id=task_id,
     )
     if idempotency_key:
         session.add(
@@ -200,8 +293,11 @@ def invoke(
                 id=new_id(),
                 principal_id=mandate.principal_id,
                 idempotency_key=idempotency_key,
+                request_hash=req_hash,
                 result_json=json.dumps(result.to_dict()),
             )
         )
         session.flush()
+    session.commit()
+    billing.drain_outbox()
     return result
