@@ -22,12 +22,16 @@ Do not push a registry from CI.
 
 ## Compose (staging)
 
+`docker compose up` starts **postgres + api + worker**. The worker **must run**; without it, billing outbox rows stay `pending`/`dead` and never drain to Stripe. Profile `caddy` adds the reverse proxy.
+
 ```bash
 cp .env.example .env   # fill values locally; never commit .env
 docker compose up --build
+# optional TLS proxy:
+# docker compose --profile caddy up --build
 ```
 
-Services: `postgres`, `api`, `worker`. Profile `caddy` adds the reverse proxy.
+Equivalent full stack: `docker compose --profile staging up --build` (caddy is the only profiled service; api/worker/postgres start by default).
 
 ## Migration
 
