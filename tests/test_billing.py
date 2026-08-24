@@ -350,6 +350,7 @@ def test_billing_status_and_admin_attach(cx, monkeypatch):
     assert body["plan_price_id"] == "price_plan_env"
     assert body["fee_bps"] == 4
     assert "receipt_count" in body
+    assert body["outbox_dead"] == 0
     customer_attach = client.post(
         f"/v1/admin/accounts/{acct}/stripe-customer",
         json={"stripe_customer_id": "cus_nope"},
