@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from sqlalchemy import select
+from sqlalchemy import select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
@@ -48,29 +48,54 @@ def reserve(
     idempotency_key: str | None = None,
     nonce: str | None = None,
     task_id: str | None = None,
+    record_deny: bool = True,
 ) -> Reservation:
+    """Atomically debit remaining_cents when the row still has enough budget.
+
+    Single conditional UPDATE (SQLite and Postgres):
+      UPDATE mandates SET remaining_cents = remaining_cents - :cost,
+                          calls_used = calls_used + 1
+      WHERE id = :id AND remaining_cents >= :cost AND revoked = 0
+      RETURNING remaining_cents, calls_used
+    """
     if amount_cents < 0:
         raise PolicyDenied(Reason.INVALID_AMOUNT, "reserve amount must be >= 0")
-    locked = session.execute(select(Mandate).where(Mandate.id == mandate.id)).scalar_one()
-    if locked.remaining_cents < amount_cents:
-        append_event(
-            session,
-            principal_id=locked.principal_id,
-            mandate_id=locked.id,
-            kind="deny",
-            amount_cents=amount_cents,
-            remaining_after=locked.remaining_cents,
-            idempotency_key=idempotency_key,
-            note=Reason.BUDGET_EXCEEDED,
-            task_id=task_id,
+    row = session.execute(
+        update(Mandate)
+        .where(
+            Mandate.id == mandate.id,
+            Mandate.remaining_cents >= amount_cents,
+            Mandate.revoked.is_(False),
         )
-        raise PolicyDenied(Reason.BUDGET_EXCEEDED, f"need {amount_cents} have {locked.remaining_cents}")
-    locked.remaining_cents -= amount_cents
-    locked.calls_used += 1
+        .values(
+            remaining_cents=Mandate.remaining_cents - amount_cents,
+            calls_used=Mandate.calls_used + 1,
+        )
+        .returning(Mandate.remaining_cents, Mandate.calls_used)
+    ).first()
+    if row is None:
+        locked = session.get(Mandate, mandate.id)
+        remaining = locked.remaining_cents if locked is not None else 0
+        principal_id = locked.principal_id if locked is not None else mandate.principal_id
+        mid = locked.id if locked is not None else mandate.id
+        if record_deny:
+            append_event(
+                session,
+                principal_id=principal_id,
+                mandate_id=mid,
+                kind="deny",
+                amount_cents=amount_cents,
+                remaining_after=remaining,
+                idempotency_key=idempotency_key,
+                note=Reason.BUDGET_EXCEEDED,
+                task_id=task_id,
+            )
+        raise PolicyDenied(Reason.BUDGET_EXCEEDED, f"need {amount_cents} have {remaining}")
+    session.refresh(mandate)
     res = Reservation(
         id=new_id(),
-        principal_id=locked.principal_id,
-        mandate_id=locked.id,
+        principal_id=mandate.principal_id,
+        mandate_id=mandate.id,
         amount_cents=amount_cents,
         status="held",
         idempotency_key=idempotency_key,
@@ -80,17 +105,15 @@ def reserve(
     session.flush()
     append_event(
         session,
-        principal_id=locked.principal_id,
-        mandate_id=locked.id,
+        principal_id=mandate.principal_id,
+        mandate_id=mandate.id,
         kind="reserve",
         amount_cents=amount_cents,
-        remaining_after=locked.remaining_cents,
+        remaining_after=mandate.remaining_cents,
         reservation_id=res.id,
         idempotency_key=idempotency_key,
         task_id=task_id,
     )
-    mandate.remaining_cents = locked.remaining_cents
-    mandate.calls_used = locked.calls_used
     return res
 
 
@@ -108,10 +131,11 @@ def _claim_idempotency(
     idempotency_key: str,
     request_hash: str | None,
 ) -> IdempotencyRecord:
-    """Insert durable claim (status=in_progress) or raise replay/conflict/in-progress.
+    """Insert LogicalOperation claim (status=in_progress) or raise replay/conflict/in-progress.
 
-    Must run in the same transaction as reserve. Unique (principal_id, key)
-    is the concurrency gate: losers do not decrement budget.
+    Unique (principal_id, key) is the concurrency gate: losers do not decrement budget.
+    Completed claims replay. in_progress claims return IN_PROGRESS unless rolled back
+    or explicitly released for retry.
     """
     rec = IdempotencyRecord(
         id=new_id(),
@@ -155,53 +179,88 @@ def reserve_and_commit(
     request_hash: str | None = None,
     task_id: str | None = None,
 ) -> tuple[Reservation, Invocation]:
-    """Claim idempotency, write reservation + decrement remaining, COMMIT before execute.
+    """Claim + reserve + invocation insert as one savepoint, then COMMIT.
 
-    Crash-after-execute-before-commit leaves this reserved Invocation row durable.
-    It must not silently roll back the reserve.
+    If reserve fails, the LogicalOperation claim rolls back with the savepoint.
+    Deny events are recorded *outside* that unit so they persist without a
+    poisoned in_progress claim.
     """
-    if idempotency_key:
-        _claim_idempotency(
-            session,
-            principal_id=mandate.principal_id,
-            idempotency_key=idempotency_key,
-            request_hash=request_hash,
-        )
-    res = reserve(
-        session,
-        mandate,
-        amount_cents,
-        idempotency_key=idempotency_key,
-        nonce=nonce,
-        task_id=task_id,
-    )
-    inv = Invocation(
-        id=new_id(),
-        principal_id=mandate.principal_id,
-        mandate_id=mandate.id,
-        reservation_id=res.id,
-        task_id=task_id,
-        tool=tool,
-        server=server,
-        request_hash=request_hash,
-        idempotency_key=idempotency_key,
-        amount_cents=amount_cents,
-        status="reserved",
-    )
-    session.add(inv)
-    session.flush()
+    try:
+        with session.begin_nested():
+            if idempotency_key:
+                _claim_idempotency(
+                    session,
+                    principal_id=mandate.principal_id,
+                    idempotency_key=idempotency_key,
+                    request_hash=request_hash,
+                )
+            res = reserve(
+                session,
+                mandate,
+                amount_cents,
+                idempotency_key=idempotency_key,
+                nonce=nonce,
+                task_id=task_id,
+                record_deny=False,
+            )
+            inv = Invocation(
+                id=new_id(),
+                principal_id=mandate.principal_id,
+                mandate_id=mandate.id,
+                reservation_id=res.id,
+                task_id=task_id,
+                tool=tool,
+                server=server,
+                request_hash=request_hash,
+                idempotency_key=idempotency_key,
+                amount_cents=amount_cents,
+                status="reserved",
+            )
+            session.add(inv)
+            session.flush()
+    except PolicyDenied as exc:
+        session.refresh(mandate)
+        if exc.reason == Reason.BUDGET_EXCEEDED:
+            append_event(
+                session,
+                principal_id=mandate.principal_id,
+                mandate_id=mandate.id,
+                kind="deny",
+                amount_cents=amount_cents,
+                remaining_after=mandate.remaining_cents,
+                idempotency_key=idempotency_key,
+                note=Reason.BUDGET_EXCEEDED,
+                task_id=task_id,
+            )
+        raise
     session.commit()
     return res, inv
+
+
+def _clear_logical_operation(session: Session, invocation: Invocation) -> None:
+    if not invocation.idempotency_key:
+        return
+    claim = session.scalar(
+        select(IdempotencyRecord).where(
+            IdempotencyRecord.principal_id == invocation.principal_id,
+            IdempotencyRecord.idempotency_key == invocation.idempotency_key,
+        )
+    )
+    if claim is not None:
+        session.delete(claim)
 
 
 def recover_reserved(session: Session, invocation: Invocation, *, mode: str = "ambiguous") -> Invocation:
     """Recover reserved+no-outcome rows.
 
     Default mode is ``ambiguous``: mark the row ambiguous and do **not**
-    refund remaining. Operators must inspect ambiguous invocations and
-    only refund when they can prove execute never started.
+    refund remaining and do **not** clear the LogicalOperation claim.
+    Retry of the same key stays blocked (IN_PROGRESS / wait-or-conflict).
 
-    Explicit ``mode="release"`` is the only path that refunds remaining.
+    Explicit ``mode="release"`` refunds remaining, marks the attempt released,
+    and deletes the matching IdempotencyRecord so the same key can be retried
+    as a new ExecutionAttempt. Only use when execute can be proven never to
+    have started.
     """
     if invocation.status != "reserved":
         return invocation
@@ -210,6 +269,7 @@ def recover_reserved(session: Session, invocation: Invocation, *, mode: str = "a
         if res is not None:
             release(session, res, task_id=invocation.task_id)
         invocation.status = "released"
+        _clear_logical_operation(session, invocation)
         session.flush()
         return invocation
     invocation.status = "ambiguous"
