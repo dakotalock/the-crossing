@@ -10,10 +10,12 @@ from sqlalchemy import (
     CheckConstraint,
     DateTime,
     ForeignKey,
+    Index,
     Integer,
     String,
     Text,
     UniqueConstraint,
+    text,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
@@ -177,6 +179,7 @@ class Outbox(Base):
     payload_json: Mapped[str] = mapped_column(Text)
     status: Mapped[str] = mapped_column(String(20), default="pending")  # pending|sent|failed|noop
     attempts: Mapped[int] = mapped_column(Integer, default=0)
+    next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
@@ -191,7 +194,9 @@ class IdempotencyRecord(Base):
     principal_id: Mapped[str] = mapped_column(String(36), index=True)
     idempotency_key: Mapped[str] = mapped_column(String(120))
     request_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
-    result_json: Mapped[str] = mapped_column(Text)
+    # in_progress | completed — claim row is inserted before reserve
+    status: Mapped[str] = mapped_column(String(20), default="in_progress")
+    result_json: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
@@ -209,6 +214,16 @@ class Invocation(Base):
     """Durable operations row. reserve_and_commit writes status=reserved before execute."""
 
     __tablename__ = "invocations"
+    __table_args__ = (
+        Index(
+            "uq_invocation_principal_idempotency_key",
+            "principal_id",
+            "idempotency_key",
+            unique=True,
+            sqlite_where=text("idempotency_key IS NOT NULL"),
+            postgresql_where=text("idempotency_key IS NOT NULL"),
+        ),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     principal_id: Mapped[str] = mapped_column(String(36), index=True)
@@ -220,6 +235,6 @@ class Invocation(Base):
     request_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
     idempotency_key: Mapped[str | None] = mapped_column(String(120), nullable=True)
     amount_cents: Mapped[int] = mapped_column(Integer, default=0)
-    # reserved | executed_ok | executed_fail | committed | released | ambiguous
+    # in_progress | reserved | executed_ok | executed_fail | committed | released | ambiguous
     status: Mapped[str] = mapped_column(String(20), default="reserved")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
