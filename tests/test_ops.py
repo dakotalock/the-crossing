@@ -47,6 +47,12 @@ def test_healthz_and_readyz(cx):
     mx = client.get("/metrics")
     assert mx.status_code == 200
     assert "crossing_invokes_total" in mx.text
+    wk = client.get("/.well-known/crossing-keys")
+    assert wk.status_code == 200
+    doc = wk.json()
+    kids = {k["kid"]: k["pubkey_hex"] for k in doc["keys"]}
+    assert crypto.key_id() in kids
+    assert kids[crypto.key_id()] == crypto.pubkey_hex()
     js = client.get("/metrics?format=json")
     assert "invokes_total" in js.json()
 

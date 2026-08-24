@@ -79,12 +79,37 @@ def issue(
     return rec
 
 
-def verify_receipt(receipt: Receipt | dict[str, Any], *, body: dict[str, Any] | None = None) -> bool:
+def verify_receipt(
+    receipt: Receipt | dict[str, Any],
+    *,
+    body: dict[str, Any] | None = None,
+    keys: dict[str, str] | None = None,
+) -> bool:
+    """Verify a receipt against Crossing issuer keys, never against a key inside the artifact.
+
+    `keys` is kid -> pubkey_hex. Default is this process's issuer key. A third party
+    should pass the document from GET /.well-known/crossing-keys (map kid to pubkey_hex).
+    """
     if isinstance(receipt, dict):
-        payload = body or receipt.get("body") or {k: v for k, v in receipt.items() if k not in ("signature", "pubkey_hex")}
-        return crypto.verify_obj(payload, receipt["signature"], receipt.get("pubkey_hex"))
-    payload = body if body is not None else receipt.body_obj()
-    return crypto.verify_obj(payload, receipt.signature, receipt.pubkey_hex)
+        payload = body or receipt.get("body") or {
+            k: v for k, v in receipt.items() if k not in ("signature", "pubkey_hex")
+        }
+        signature = receipt.get("signature")
+        carried = receipt.get("pubkey_hex")
+    else:
+        payload = body if body is not None else receipt.body_obj()
+        signature = receipt.signature
+        carried = receipt.pubkey_hex
+    if not isinstance(payload, dict) or not signature:
+        return False
+    kid = payload.get("kid")
+    directory = dict(keys) if keys is not None else crypto.issuer_keys()
+    if not kid or kid not in directory:
+        return False
+    anchored = directory[kid]
+    if carried and carried != anchored:
+        return False
+    return crypto.verify_obj(payload, signature, anchored)
 
 
 def to_dict(receipt: Receipt) -> dict[str, Any]:

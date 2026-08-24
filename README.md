@@ -63,7 +63,7 @@ In scope (enforced in-process):
 | --- | --- |
 | Forged mandate / minted authority | Issuer key is the trust root; request pubkeys must already be bound |
 | Tampered enforcement columns | Reconstruct signed payload; deny `SIGNED_STATE_DIVERGED` |
-| Tampered receipt | Ed25519 over canonical receipt body (hashes by default) |
+| Tampered / forged receipt | Ed25519 over canonical body; `verify_receipt` resolves `kid` from `/.well-known/crossing-keys` (or the process issuer key). A pubkey inside the receipt is never a trust root |
 | Overspend / TOCTOU | Atomic per-row debit (`UPDATE … RETURNING`); durable reserve commit before execute; `BEGIN IMMEDIATE` on SQLite |
 | Crash after execute | `invocations` attempt stays `executing` (dispatch started) or `executed_fail`; recover_reserved will not auto-refund `executing` |
 | Child privilege escalation | Attenuation + agent descendant check |
@@ -88,6 +88,7 @@ Out of scope for this MVP:
 ## HTTP
 
 - `GET /health` `GET /healthz` (liveness)
+- `GET /.well-known/crossing-keys` (issuer kid + pubkey; unauthenticated)
 - `GET /readyz` (readiness; checks DB)
 - `GET /metrics` (prometheus text; `?format=json` for counters: invokes, denials by reason, outbox backlog, `crossing_outbox_dead`)
 - `GET /v1/account`
@@ -107,6 +108,8 @@ Out of scope for this MVP:
 - POST `/v1/principals` and `/v1/agents` require `write` or `mandate:issue` (not `read` alone)
 
 ## Receipts
+
+`verify_receipt` trusts `kid` only if it appears in that directory (or the in-process issuer key). A `pubkey_hex` riding on the receipt is not a trust root.
 
 Default receipt body is hashes only (`request_hash`, `response_hash`) plus `agent_id`, `task_id`, `mandate_id`, `tool`, `server`, `amount_cents`, `outcome`, `reservation_id`, and `kid` (signing key version). Full tool results are stored only when `CROSSING_RETAIN_PAYLOADS=1`. `task_id` is wired through ledger events and receipts. Production signing still refuses ephemeral keys unless `CROSSING_ALLOW_DEV=1`. Default store is env seed; production recommendation is HSM/KMS (`CROSSING_KEY_BACKEND=hsm` fails closed until wired).
 
