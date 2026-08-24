@@ -54,10 +54,12 @@ Provider tokens: `CROSSING_PROVIDER_TOKEN_<NAME>`.
 
 See `docs/runbook.md`. Schedule `pg_dump` and store off-box. Test restore on a scratch database.
 
+Compose binds Postgres to `127.0.0.1:5432` only (not `0.0.0.0`). Set `POSTGRES_PASSWORD` in `.env`; do not ship a production password in compose. Caddyfile `:80` is local/staging — TLS is required on the internet (hostname site block).
+
 ## Firewall
 
-- Postgres not on the public internet.
-- API only via Caddy (HTTPS).
+- Postgres not on the public internet (localhost bind or no host port).
+- API only via Caddy (HTTPS / TLS at the edge).
 - Egress: Stripe + allowlisted provider hosts only.
 - Deny cloud metadata (`169.254.169.254`) from app units (Crossing also refuses those URLs unless internal allowlist).
 

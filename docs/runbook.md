@@ -17,12 +17,13 @@ Never log or paste `CROSSING_ED25519_SEED`, `CROSSING_KEY_PEPPER`, Stripe secret
 
 ## Outbox backlog
 
-`GET /metrics` (`crossing_outbox_backlog`) or SQL `billing_outbox` where status in (`pending`,`failed`,`sending`).
+`GET /metrics` (`crossing_outbox_backlog`, `crossing_outbox_dead`) or SQL `billing_outbox`.
 
-- Worker: `python -m crossing.worker --once` then the loop.
-- Stale `sending` (lease default 30s) is reclaimable by another drain.
+- Worker: `python -m crossing.worker --once` then the loop. API invoke/reconcile do **not** HTTP to Stripe.
+- Stale `sending` (lease default 30s) is reclaimable by another drain (retry uses the same Stripe Idempotency-Key / receipt_id).
 - After 8 attempts the row is `dead` — inspect `last_error` (no secrets), fix Stripe config, do not rewrite ledger remaining.
-- HTTP to Stripe only happens in the worker after COMMIT.
+- Requeue dead → pending: `POST /v1/admin/outbox/{id}/requeue` (admin) or `python -m crossing.worker --requeue-dead [id]`.
+- HTTP to Stripe only happens in the worker after the sending claim is COMMITTED.
 
 ## Signing key
 
