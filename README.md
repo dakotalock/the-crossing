@@ -35,7 +35,7 @@ flowchart LR
   MCP -->|ok| Receipts
   Receipts -->|Ed25519| Human
   Ledger -->|commit + outbox row| Outbox
-  Outbox -->|drain_outbox POST| Stripe
+  Outbox -->|worker drain_outbox POST| Stripe
   MCP -->|error| Release[release reservation]
 ```
 
@@ -89,7 +89,7 @@ Out of scope for this MVP:
 
 - `GET /health` `GET /healthz` (liveness)
 - `GET /readyz` (readiness; checks DB)
-- `GET /metrics` (prometheus text; `?format=json` for counters: invokes, denials by reason, outbox backlog)
+- `GET /metrics` (prometheus text; `?format=json` for counters: invokes, denials by reason, outbox backlog, `crossing_outbox_dead`)
 - `GET /v1/account`
 - `GET /` dashboard (plain HTML tables; `X-API-Key` header required, not `?key=`)
 - `POST/GET /v1/principals`
@@ -101,8 +101,10 @@ Out of scope for this MVP:
 - `POST /v1/mandates/{id}/revoke`
 - `POST /v1/invocations/{id}/reconcile` (`outcome=committed|released`, `evidence_ref` required)
 - `POST /v1/stripe/webhooks` (Stripe-Signature; replay of the same `event_id` is 200 no-op)
-- `POST /v1/admin/accounts/{id}/stripe-customer` (admin; attach `stripe_customer_id`)
+- `POST /v1/admin/accounts/{id}/stripe-customer` (admin; attach unique `stripe_customer_id`)
+- `POST /v1/admin/outbox/{id}/requeue` (admin; dead → pending)
 - `GET /v1/billing/status` (scope `billing:read`; plan id, customer present?, usage; never Stripe secrets)
+- POST `/v1/principals` and `/v1/agents` require `write` or `mandate:issue` (not `read` alone)
 
 ## Receipts
 
@@ -137,15 +139,17 @@ Crossing still only guarantees at-most-one dispatch from Crossing, not exactly-o
 | `search` | $0.05 |
 | `purchase` / `expensive` | $5.00 |
 
-Stripe is **control-plane billing, not custody**. Map `accounts.stripe_customer_id` (nullable). Env: `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`, `STRIPE_PRICE_ID` (subscription), optional `STRIPE_METER_EVENT`. If `STRIPE_SECRET_KEY` is unset the adapter no-ops **and still writes a billing_outbox row** (`status=noop` after drain). HTTP to Stripe happens only in `drain_outbox()` / `python -m crossing.worker`, after the ledger/receipt commit. Failures mark `failed` (with `attempts`, `next_attempt_at`, `last_error`) and never undo `commit`. One outbox row per `receipt_id` (unique). Drain CAS-claims `pending`/`failed` (due `next_attempt_at`) **or stale `sending`** (lease/heartbeat, default 30s) → `sending` so two workers cannot double-send. Backoff is 1, 2, 4, 8… minutes (cap 60). After 8 attempts the row is `dead`. `python -m crossing.worker --once` drains one batch.
+Stripe is **control-plane billing, not custody**. Map `accounts.stripe_customer_id` (nullable **unique**). There is no global `STRIPE_CUSTOMER_ID` env fallback — only the account row. Env: `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`, `STRIPE_PRICE_ID` (subscription), optional `STRIPE_METER_EVENT`. If `STRIPE_SECRET_KEY` is unset the adapter no-ops **and still writes a billing_outbox row** (`status=noop` after the worker drains). When the secret **is** set, `invoke` and `reconcile_commit` refuse with `BILLING_REQUIRED` unless the authenticated account has a customer id and `stripe_status` is not unpaid/canceled.
 
-Platform fee: integer `CROSSING_FEE_BPS` (default 0). Fees accumulate as integer **microcents** (`amount_cents * bps * 100`); a 4bps event that is below 1 cent is **not** rounded to zero. Whole cents are invoiced only when the remainder reaches `>= 1` cent. Commercial Stripe price ids are not written to the ledger.
+HTTP to Stripe happens **only** in `python -m crossing.worker` (`drain_outbox`): CAS pending/failed/stale-sending → `sending` **COMMIT**, then POST, then CAS `sending→sent|failed|dead` **COMMIT**. The API process does not drain. Failures never undo ledger `commit`. One outbox row per `receipt_id` (unique). Stripe Idempotency-Key is `receipt_id`. Backoff is 1, 2, 4, 8… minutes (cap 60). After 8 attempts the row is `dead` (visible as `crossing_outbox_dead`). Requeue: `POST /v1/admin/outbox/{id}/requeue` or `python -m crossing.worker --requeue-dead [id]`.
+
+Platform fee: integer `CROSSING_FEE_BPS` (default **0**). Do not turn fees on until a Stripe invoice/line item exists — `post_stripe` meters usage only and does **not** send a fee. Microcents accumulate (`amount_cents * bps * 100`); `fee_invoiced_cents` is not incremented (Crossing does not pretend Stripe was billed). Commercial Stripe price ids are not written to the ledger.
 
 Webhook: verify `stripe-signature`, persist `stripe_events.event_id` as PK. Replay is 200 + `duplicate: true` and does not mutate Crossing remaining/commit state.
 
 ## Postgres
 
-Install `psycopg[binary]` (listed in `requirements.txt`) and set `DATABASE_URL=postgresql+psycopg://crossing:crossing@localhost:5432/crossing`.
+Install `psycopg[binary]` (listed in `requirements.txt`) and set `DATABASE_URL` (compose binds Postgres at `127.0.0.1:5432` only; password from `POSTGRES_PASSWORD`, local default is not a production secret).
 
 The mandate debit, child escrow, and reservation terminal transitions are conditional updates (SQLite and Postgres). Local default is still SQLite. CI has a `postgres` job (`DATABASE_URL=postgresql+psycopg://…`). That is not multi-host consensus.
 
@@ -173,7 +177,7 @@ UPDATE invocations SET status='reconciled_released'
  WHERE id=:id AND status IN ('ambiguous','executed_fail') RETURNING …
 ```
 
-`reconciled_committed` applies the same economic effects as `finalize_success` (receipt + outbox + claim completed) **exactly once**; a prior success is not double-billed. `reconciled_released` refunds remaining exactly once (`held→released` CAS). LogicalOperation is cleared only when evidence says execution **did not** occur. Evidence `did_execute` cannot use the released path. `evidence_ref` is required; actor is the API key id. Historical attempts are never deleted.
+`reconciled_committed` requires `evidence_kind=did_execute` and applies the same economic effects as `finalize_success` (receipt + outbox + claim completed) **exactly once**; a prior success is not double-billed. `reconciled_released` requires `did_not_execute` and refunds remaining exactly once (`held→released` CAS). LogicalOperation is cleared only when evidence says execution **did not** occur. `evidence_ref` is required; actor is the API key id. Historical attempts are never deleted. `finalize_release` defaults to invocation status `reserved` only (does not refund `executed_fail`).
 
 Provider exactly-once is **not** guaranteed without reconcil evidence. Crossing still only guarantees at-most-one *dispatch from Crossing*.
 
