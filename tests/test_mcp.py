@@ -4,7 +4,10 @@ from crossing import mock_mcp
 from crossing.models import LedgerEvent, Reservation
 
 
-def test_mcp_error_releases_reservation(seeded):
+def test_mcp_error_after_dispatch_does_not_refund(seeded):
+    """Tool throw after executing is committed is not an automatic refund."""
+    from crossing.models import IdempotencyRecord, Invocation
+
     cx, _, _, m = seeded
 
     def boom(_args, **_ids):
@@ -15,13 +18,18 @@ def test_mcp_error_releases_reservation(seeded):
         r = cx.invoke(m.id, "search", {"q": "boom"}, idempotency_key="mcp-err")
         assert r.ok is False
         assert r.reason == "MCP_ERROR"
-        assert cx.remaining(m.id) == 100
+        assert cx.remaining(m.id) == 95
         with cx.session() as s:
             holds = s.query(Reservation).all()
-            assert holds and holds[0].status == "released"
+            assert holds and holds[0].status == "held"
+            invs = s.query(Invocation).all()
+            assert invs and invs[0].status == "executed_fail"
             kinds = [e.kind for e in s.query(LedgerEvent).all()]
-            assert "reserve" in kinds and "release" in kinds
+            assert "reserve" in kinds
+            assert "release" not in kinds
             assert "commit" not in kinds
+            claim = s.query(IdempotencyRecord).filter_by(idempotency_key="mcp-err").one()
+            assert claim.status == "in_progress"
     finally:
         mock_mcp.HOOKS.clear()
 
