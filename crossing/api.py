@@ -39,6 +39,9 @@ def _boot() -> None:
         auth.key_pepper()
     if db.SessionLocal is None:
         db.init_db()
+    from crossing import billing
+
+    billing.warn_unsent_fees()
 
 
 @asynccontextmanager
@@ -137,6 +140,12 @@ def require_scope(scope: str):
         return ctx
 
     return _inner
+
+
+def require_write(ctx: AuthContext = Depends(require_auth)) -> AuthContext:
+    if ctx.has_scope("write") or ctx.has_scope("mandate:issue"):
+        return ctx
+    raise _forbidden("missing write scope")
 
 
 def _own_principal(session, ctx: AuthContext, principal_id: str) -> Principal:
@@ -291,7 +300,7 @@ def get_account(ctx: AuthContext = Depends(require_scope("read"))) -> dict[str, 
 
 
 @app.post("/v1/principals")
-def post_principal(body: PrincipalIn, ctx: AuthContext = Depends(require_scope("read"))) -> dict[str, Any]:
+def post_principal(body: PrincipalIn, ctx: AuthContext = Depends(require_write)) -> dict[str, Any]:
     with db.session_scope() as s:
         if not ctx.is_admin:
             existing = s.query(Principal).filter(Principal.account_id == ctx.account_id).first()
@@ -311,7 +320,7 @@ def list_principals(ctx: AuthContext = Depends(require_scope("read"))) -> list[d
 
 
 @app.post("/v1/agents")
-def post_agent(body: AgentIn, ctx: AuthContext = Depends(require_scope("read"))) -> dict[str, Any]:
+def post_agent(body: AgentIn, ctx: AuthContext = Depends(require_write)) -> dict[str, Any]:
     try:
         with db.session_scope() as s:
             _own_principal(s, ctx, body.principal_id)
@@ -328,7 +337,7 @@ def post_agent(body: AgentIn, ctx: AuthContext = Depends(require_scope("read")))
 
 
 @app.post("/v1/agents/{agent_id}/revoke")
-def post_revoke(agent_id: str, ctx: AuthContext = Depends(require_scope("read"))) -> dict[str, Any]:
+def post_revoke(agent_id: str, ctx: AuthContext = Depends(require_write)) -> dict[str, Any]:
     with db.session_scope() as s:
         a = s.get(Agent, agent_id)
         if a is None:
@@ -488,14 +497,22 @@ def post_key(body: KeyIn, ctx: AuthContext = Depends(require_scope("admin"))) ->
         return auth.public_key_view(issued.record, secret=issued.secret)
 
 
+def _may_manage_key(ctx: AuthContext, row: ApiKey) -> None:
+    if row is None:
+        raise _closed()
+    if not ctx.is_admin and row.account_id != ctx.account_id:
+        raise _closed()
+    scopes = json.loads(row.scopes_json or "[]")
+    admin_target = row.kind == "admin" or "admin" in scopes
+    if admin_target and not ctx.is_admin and ctx.api_key_id != row.id:
+        raise _forbidden("admin key rotate/revoke requires admin or the same key")
+
+
 @app.post("/v1/keys/{key_id}/rotate")
 def post_key_rotate(key_id: str, ctx: AuthContext = Depends(require_auth)) -> dict[str, Any]:
     with db.session_scope() as s:
         row = s.get(ApiKey, key_id)
-        if row is None:
-            raise _closed()
-        if not ctx.is_admin and row.account_id != ctx.account_id:
-            raise _closed()
+        _may_manage_key(ctx, row)
         issued = auth.rotate_api_key(s, key_id)
         return auth.public_key_view(issued.record, secret=issued.secret)
 
@@ -504,10 +521,7 @@ def post_key_rotate(key_id: str, ctx: AuthContext = Depends(require_auth)) -> di
 def post_key_revoke(key_id: str, ctx: AuthContext = Depends(require_auth)) -> dict[str, Any]:
     with db.session_scope() as s:
         row = s.get(ApiKey, key_id)
-        if row is None:
-            raise _closed()
-        if not ctx.is_admin and row.account_id != ctx.account_id:
-            raise _closed()
+        _may_manage_key(ctx, row)
         row = auth.revoke_api_key(s, key_id)
         return auth.public_key_view(row)
 
@@ -530,6 +544,13 @@ def post_reconcile(
             if inv.principal_id not in ids:
                 raise _closed()
         actor = ctx.api_key_id
+        if body.outcome == "committed" and billing.configured():
+            try:
+                billing.require_billable(s, inv.principal_id)
+            except PolicyDenied as exc:
+                raise HTTPException(
+                    status_code=403, detail={"reason": exc.reason, "detail": exc.detail}
+                ) from exc
 
         def receipt_fn(sess):
             return receipts.issue(
@@ -576,7 +597,6 @@ def post_reconcile(
                 raise HTTPException(status_code=400, detail="outcome must be committed or released")
         except PolicyDenied as exc:
             raise HTTPException(status_code=400, detail={"reason": exc.reason, "detail": exc.detail}) from exc
-        billing.drain_outbox()
         return {
             "ok": True,
             "won": result.won,
@@ -625,11 +645,36 @@ def post_admin_stripe_customer(
             raise _closed()
         if not ctx.is_admin:
             raise _forbidden()
-        acct = billing.attach_stripe_customer(s, account_id, body.stripe_customer_id)
+        try:
+            acct = billing.attach_stripe_customer(s, account_id, body.stripe_customer_id)
+        except PolicyDenied as exc:
+            raise HTTPException(status_code=409, detail={"reason": exc.reason, "detail": exc.detail}) from exc
         return {
             "account_id": acct.id,
             "stripe_customer_present": bool(acct.stripe_customer_id),
         }
+
+
+@app.post("/v1/admin/outbox/{outbox_id}/requeue")
+def post_admin_requeue_dead(
+    outbox_id: str,
+    ctx: AuthContext = Depends(require_scope("admin")),
+) -> dict[str, Any]:
+    """Requeue a dead outbox row to pending. Worker claims it. Admin scope."""
+    from crossing import billing
+    from crossing.models import Outbox
+
+    with db.session_scope() as s:
+        row = s.get(Outbox, outbox_id)
+        if row is None:
+            raise _closed()
+        if not ctx.is_admin:
+            raise _forbidden()
+        if row.status != "dead":
+            raise HTTPException(status_code=400, detail={"reason": "not_dead"})
+        billing.requeue_dead(s, outbox_id)
+        s.refresh(row)
+        return {"id": row.id, "status": row.status}
 
 
 @app.get("/v1/billing/status")
