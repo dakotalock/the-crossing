@@ -1,0 +1,16 @@
+# Optional Postgres. Default runtime is SQLite (DATABASE_URL=sqlite:///./crossing.db).
+services:
+  postgres:
+    image: postgres:16-alpine
+    profiles: ["postgres"]
+    environment:
+      POSTGRES_USER: crossing
+      POSTGRES_PASSWORD: crossing
+      POSTGRES_DB: crossing
+    ports:
+      - "5432:5432"
+    volumes:
+      - crossing_pg:/var/lib/postgresql/data
+
+volumes:
+  crossing_pg:
