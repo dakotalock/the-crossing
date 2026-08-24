@@ -8,6 +8,7 @@ ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(ROOT))
 
 os.environ["CROSSING_ALLOW_DEV"] = "1"
+os.environ["CROSSING_JSON_LOGS"] = "0"
 os.environ.pop("STRIPE_SECRET_KEY", None)
 
 import pytest
@@ -29,6 +30,10 @@ def _test_database_url(tmp_path) -> str:
 def cx(tmp_path):
     crypto.reset_for_tests()
     db.reset_engine()
+    from crossing import abuse, metrics
+
+    abuse.reset_for_tests()
+    metrics.reset_for_tests()
     url = _test_database_url(tmp_path)
     if url.startswith("postgresql"):
         engine = db.make_engine(url)

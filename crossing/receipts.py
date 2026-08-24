@@ -54,6 +54,7 @@ def issue(
         "reservation_id": reservation_id,
         "request_hash": req_hash,
         "response_hash": resp_hash,
+        "kid": crypto.key_id(),
         "issued_at": utcnow().isoformat(),
     }
     if retain_payloads():
@@ -100,5 +101,6 @@ def to_dict(receipt: Receipt) -> dict[str, Any]:
         "body": receipt.body_obj(),
         "signature": receipt.signature,
         "pubkey_hex": receipt.pubkey_hex,
+        "kid": receipt.body_obj().get("kid"),
         "created_at": receipt.created_at.isoformat() if receipt.created_at else None,
     }
