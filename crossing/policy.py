@@ -28,6 +28,11 @@ class Reason:
     UNKNOWN_TOOL = "UNKNOWN_TOOL"
     PRODUCTION_SECRETS_MISSING = "PRODUCTION_SECRETS_MISSING"
     IDEMPOTENCY_CONFLICT = "IDEMPOTENCY_CONFLICT"
+    SIGNED_STATE_DIVERGED = "SIGNED_STATE_DIVERGED"
+    INVALID_AMOUNT = "INVALID_AMOUNT"
+    AGENT_PRINCIPAL_MISMATCH = "AGENT_PRINCIPAL_MISMATCH"
+    CHILD_AGENT_NOT_DESCENDANT = "CHILD_AGENT_NOT_DESCENDANT"
+    UNAUTHORIZED = "UNAUTHORIZED"
 
 
 @dataclass
@@ -71,9 +76,83 @@ def check_agent(agent: Any) -> None:
         raise PolicyDenied(Reason.AGENT_REVOKED, "agent is revoked")
 
 
-def check_mandate_signature(mandate: Any, verify_fn) -> None:
+def check_non_negative_money(**amounts: int | None) -> None:
+    for name, value in amounts.items():
+        if value is None:
+            continue
+        if int(value) < 0:
+            raise PolicyDenied(Reason.INVALID_AMOUNT, f"{name} must be >= 0")
+
+
+def _norm_list(v: Any) -> list[str] | None:
+    if v is None:
+        return None
+    return sorted(v)
+
+
+def check_signed_state(mandate: Any) -> None:
+    """Compare immutable signed payload to enforcement columns.
+
+    remaining_cents and calls_used (used_calls) are mutable accounting and MUST NOT
+    appear in the signed payload. remaining starts equal to signed spend_limit.
+    """
+    from crossing.mandate import mandate_payload
+
+    signed = mandate.payload_obj()
+    if "remaining_cents" in signed or "calls_used" in signed or "used_calls" in signed:
+        raise PolicyDenied(Reason.SIGNED_STATE_DIVERGED, "mutable accounting in signed payload")
+    rebuilt = mandate_payload(
+        principal_id=mandate.principal_id,
+        agent_id=mandate.agent_id,
+        parent_mandate_id=mandate.parent_mandate_id,
+        spend_limit_cents=mandate.spend_limit_cents,
+        max_call_cents=mandate.max_call_cents,
+        max_calls=mandate.max_calls,
+        tools=mandate.tools_list(),
+        servers=mandate.servers_list(),
+        expires_at=mandate.expires_at,
+        max_subagent_budget_cents=mandate.max_subagent_budget_cents,
+        nonce=mandate.nonce,
+    )
+    keys = (
+        "principal_id",
+        "agent_id",
+        "parent_mandate_id",
+        "spend_limit_cents",
+        "max_call_cents",
+        "max_calls",
+        "tools",
+        "servers",
+        "expires_at",
+        "max_subagent_budget_cents",
+        "nonce",
+    )
+    for k in keys:
+        sv, rv = signed.get(k), rebuilt.get(k)
+        if k in ("tools", "servers"):
+            if _norm_list(sv) != _norm_list(rv):
+                raise PolicyDenied(Reason.SIGNED_STATE_DIVERGED, k)
+        elif k == "expires_at":
+            if (sv or None) != (rv or None):
+                raise PolicyDenied(Reason.SIGNED_STATE_DIVERGED, k)
+        elif sv != rv:
+            raise PolicyDenied(Reason.SIGNED_STATE_DIVERGED, k)
+
+
+def bound_pubkeys(principal: Any, issuer_hex: str) -> set[str]:
+    keys = {issuer_hex}
+    stored = getattr(principal, "pubkey_hex", None) if principal is not None else None
+    if stored:
+        keys.add(stored)
+    return keys
+
+
+def check_mandate_signature(mandate: Any, verify_fn, *, allowed_pubkeys: set[str] | None = None) -> None:
     payload = mandate.payload_obj()
-    if not verify_fn(payload, mandate.signature, mandate.pubkey_hex):
+    key = mandate.pubkey_hex
+    if allowed_pubkeys is not None and key not in allowed_pubkeys:
+        raise PolicyDenied(Reason.MANDATE_FORGED, "pubkey is not a registered trust anchor")
+    if not verify_fn(payload, mandate.signature, key):
         raise PolicyDenied(Reason.MANDATE_FORGED, "signature mismatch")
 
 
@@ -87,6 +166,7 @@ def check_fresh(mandate: Any, now: datetime | None = None) -> None:
 
 
 def check_tool(mandate: Any, tool: str, server: str, price_cents: int) -> None:
+    check_signed_state(mandate)
     tools = mandate.tools_list()
     servers = mandate.servers_list()
     if tools is not None and tool not in tools:
@@ -111,6 +191,8 @@ def check_child_attenuation(
     expires_at: datetime | None,
     max_subagent_budget_cents: int | None,
 ) -> None:
+    if spend_limit_cents <= 0:
+        raise PolicyDenied(Reason.INVALID_AMOUNT, "child spend must be > 0")
     if spend_limit_cents > parent.remaining_cents:
         raise PolicyDenied(
             Reason.CHILD_SPEND_ESCALATION,
@@ -132,6 +214,8 @@ def check_child_attenuation(
     if parent.max_subagent_budget_cents is not None:
         cap = min(cap, parent.max_subagent_budget_cents)
     child_sub = max_subagent_budget_cents if max_subagent_budget_cents is not None else spend_limit_cents
+    if child_sub is not None and child_sub < 0:
+        raise PolicyDenied(Reason.INVALID_AMOUNT, "max_subagent_budget_cents must be >= 0")
     if child_sub > cap:
         raise PolicyDenied(
             Reason.CHILD_BUDGET_ESCALATION,
