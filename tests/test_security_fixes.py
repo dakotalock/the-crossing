@@ -114,6 +114,7 @@ def test_unrelated_agent_cannot_inherit_parent_mandate(seeded):
 
 def test_http_deny_leaves_ledger_row(cx):
     client = TestClient(app)
+    client.headers["X-API-Key"] = "dev"
     p = client.post("/v1/principals", json={"name": "Bob"}).json()
     a = client.post("/v1/agents", json={"principal_id": p["id"], "name": "bot"}).json()
     m = client.post(
@@ -156,14 +157,31 @@ def test_receipt_default_has_hashes_not_result(seeded):
 
 def test_api_unauthenticated_mint_forbidden_without_dev(cx, monkeypatch):
     monkeypatch.setenv("CROSSING_ALLOW_DEV", "0")
-    monkeypatch.setenv("CROSSING_API_KEY", "unit-test-key")
     monkeypatch.setenv("CROSSING_ED25519_SEED", "ab" * 32)
+    monkeypatch.setenv("CROSSING_KEY_PEPPER", "unit-test-pepper")
     crypto.reset_for_tests()
+    from crossing import auth
+
+    with db.session_scope() as s:
+        from crossing.models import Account
+
+        acct = s.query(Account).first()
+        issued = auth.issue_api_key(s, account_id=acct.id, kind="admin", scopes=list(auth.ADMIN_SCOPES))
+        secret = issued.secret
+        key_id = issued.record.id
     client = TestClient(app)
     denied = client.post("/v1/principals", json={"name": "X"})
     assert denied.status_code == 401
-    ok = client.post("/v1/principals", json={"name": "X"}, headers={"X-API-Key": "unit-test-key"})
+    ok = client.post("/v1/principals", json={"name": "X"}, headers={"X-API-Key": secret})
     assert ok.status_code == 200
+    # raw secret is not stored
+    with db.session_scope() as s:
+        from crossing.models import ApiKey
+
+        row = s.get(ApiKey, key_id)
+        assert row is not None
+        assert secret not in (row.secret_hash or "")
+        assert row.secret_hash != secret
     monkeypatch.setenv("CROSSING_ALLOW_DEV", "1")
     crypto.reset_for_tests()
 
@@ -444,3 +462,4 @@ def test_finalize_success_refuses_reserved_without_executing(seeded):
         claim = s.query(IdempotencyRecord).filter_by(idempotency_key="r8-no-exec").one()
         assert claim.status == "in_progress"
     assert cx.remaining(m.id) == 95
+
