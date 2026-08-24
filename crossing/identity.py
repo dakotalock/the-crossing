@@ -7,8 +7,8 @@ from crossing.models import Agent, Principal, Task, new_id
 from crossing.policy import PolicyDenied, Reason, check_agent
 
 
-def create_principal(session: Session, name: str) -> Principal:
-    p = Principal(id=new_id(), name=name)
+def create_principal(session: Session, name: str, pubkey_hex: str | None = None) -> Principal:
+    p = Principal(id=new_id(), name=name, pubkey_hex=pubkey_hex)
     session.add(p)
     session.flush()
     return p
@@ -55,3 +55,18 @@ def require_live_agent(session: Session, agent_id: str) -> Agent:
         parent = session.get(Agent, agent.parent_id)
         check_agent(parent)
     return agent
+
+
+def is_self_or_descendant(session: Session, agent_id: str, ancestor_id: str) -> bool:
+    if agent_id == ancestor_id:
+        return True
+    seen: set[str] = set()
+    current = session.get(Agent, agent_id)
+    while current is not None and current.parent_id:
+        if current.parent_id == ancestor_id:
+            return True
+        if current.id in seen:
+            return False
+        seen.add(current.id)
+        current = session.get(Agent, current.parent_id)
+    return False
