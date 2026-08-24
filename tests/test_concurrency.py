@@ -204,10 +204,10 @@ def test_max_calls_atomic_under_race(cx):
             session.commit()
             with lock:
                 results.append(r)
-        except Exception as exec:  # noqa: BLE001
+        except Exception as exc:  # noqa: BLE001
             session.rollback()
             with lock:
-                results.append(exec)
+                results.append(exc)
         finally:
             session.close()
 
