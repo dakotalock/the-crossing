@@ -11,7 +11,7 @@ from sqlalchemy.exc import IntegrityError
 from crossing import auth, billing, db, ledger, metrics
 from crossing.api import app
 from crossing.mandate import load_live_mandate
-from crossing.models import Account, IdempotencyRecord, Invocation, Outbox, Principal, Receipt, Reservation
+from crossing.models import Account, ApiKey, IdempotencyRecord, Invocation, Outbox, Principal, Receipt, Reservation
 from crossing.policy import PolicyDenied, Reason
 
 
@@ -101,12 +101,49 @@ def test_admin_requeue_dead(cx):
         admin = auth.issue_api_key(s, account_id=p.account_id, kind="admin")
         row = billing.enqueue(s, receipt_id="dead-rq", amount_cents=5, principal_id=p.id)
         row.status = "dead"
+        row.attempts = billing.MAX_ATTEMPTS
         oid, secret = row.id, admin.secret
     r = client.post(f"/v1/admin/outbox/{oid}/requeue", headers={"X-API-Key": secret})
     assert r.status_code == 200
     assert r.json()["status"] == "pending"
     with cx.session() as s:
-        assert s.get(Outbox, oid).status == "pending"
+        row = s.get(Outbox, oid)
+        assert row.status == "pending"
+        assert row.attempts == 0
+
+
+def test_requeue_dead_resets_attempts_drain_posts_stripe(seeded, monkeypatch):
+    """Dead rows at MAX_ATTEMPTS must reset attempts so claim/drain can post_stripe."""
+    from crossing import worker
+
+    cx, p, _, _ = seeded
+    monkeypatch.setenv("STRIPE_SECRET_KEY", "sk_test_not_real")
+    calls = {"n": 0}
+
+    def spy(_payload):
+        calls["n"] += 1
+        return {"ok": True, "stripe_reported": True}
+
+    monkeypatch.setattr(billing, "post_stripe", spy)
+    with cx.session() as s:
+        row = billing.enqueue(s, receipt_id="dead-drain", amount_cents=5, principal_id=p.id)
+        row.status = "dead"
+        row.attempts = billing.MAX_ATTEMPTS
+        oid = row.id
+    billing.drain_outbox()
+    assert calls["n"] == 0
+    with cx.session() as s:
+        billing.requeue_dead(s, oid)
+        row = s.get(Outbox, oid)
+        assert row.status == "pending"
+        assert row.attempts == 0
+        assert row.attempts < billing.MAX_ATTEMPTS
+    n = worker.run_once()
+    assert n >= 1
+    assert calls["n"] == 1
+    with cx.session() as s:
+        row = s.get(Outbox, oid)
+        assert row.status == "sent"
 
 
 def test_post_stripe_payload_does_not_claim_unsent_fees(seeded, monkeypatch):
@@ -190,6 +227,27 @@ def test_customer_cannot_rotate_admin_key(cx):
     assert steal.status_code == 403
     self_ok = client.post(f"/v1/keys/{admin_id}/rotate", headers={"X-API-Key": admin_secret})
     assert self_ok.status_code == 200
+
+
+def test_read_sibling_cannot_rotate_other_key(cx):
+    from crossing.identity import create_principal
+
+    client = TestClient(app)
+    with cx.session() as s:
+        p = create_principal(s, "SibKeys")
+        owner = auth.issue_api_key(s, account_id=p.account_id, kind="customer")
+        reader = auth.issue_api_key(
+            s, account_id=p.account_id, kind="customer", scopes=["read"]
+        )
+        owner_id, reader_secret = owner.record.id, reader.secret
+    steal = client.post(f"/v1/keys/{owner_id}/rotate", headers={"X-API-Key": reader_secret})
+    assert steal.status_code == 403
+    steal_rev = client.post(f"/v1/keys/{owner_id}/revoke", headers={"X-API-Key": reader_secret})
+    assert steal_rev.status_code == 403
+    with cx.session() as s:
+        row = s.get(ApiKey, owner_id)
+        assert row is not None
+        assert row.revoked_at is None
 
 
 def test_claim_commit_before_http_rollback_does_not_double_post(seeded, monkeypatch):
@@ -318,5 +376,6 @@ def test_compose_postgres_not_public(cx):
     assert 'POSTGRES_PASSWORD: crossing\n' not in text
     assert "0.0.0.0:5432" not in text
     assert "POSTGRES_PASSWORD" in text
+    assert 'command: ["python", "-m", "crossing.worker"]' in text
     caddy = Path("/workspace/the-crossing/Caddyfile").read_text()
     assert "TLS" in caddy
