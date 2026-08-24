@@ -7,7 +7,7 @@ from crossing.models import LedgerEvent, Reservation
 def test_mcp_error_releases_reservation(seeded):
     cx, _, _, m = seeded
 
-    def boom(_args):
+    def boom(_args, **_ids):
         raise mock_mcp.MCPError("upstream failed")
 
     mock_mcp.HOOKS["search"] = boom

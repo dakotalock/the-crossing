@@ -40,11 +40,11 @@ def test_dashboard_requires_auth(cx):
     client = TestClient(app)
     denied = client.get("/")
     assert denied.status_code == 401
+    # query-string auth was removed — must not succeed even with the real key
+    qs = client.get("/?key=dev")
+    assert qs.status_code == 401
     bad = client.get("/?key=wrong")
     assert bad.status_code == 401
     ok_header = client.get("/", headers={"X-API-Key": "dev"})
     assert ok_header.status_code == 200
     assert "principals" in ok_header.text
-    ok_query = client.get("/?key=dev")
-    assert ok_query.status_code == 200
-    assert "ledger_events" in ok_query.text
