@@ -1,16 +1,72 @@
-# Optional Postgres. Default runtime is SQLite (DATABASE_URL=sqlite:///./crossing.db).
+# Staging example: Caddy → FastAPI → Postgres + worker.
+# cp .env.example .env  (fill locally; never commit secrets)
 services:
   postgres:
     image: postgres:16-alpine
-    profiles: ["postgres"]
     environment:
       POSTGRES_USER: crossing
       POSTGRES_PASSWORD: crossing
       POSTGRES_DB: crossing
-    ports:
-      - "5432:5432"
     volumes:
       - crossing_pg:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U crossing -d crossing"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    ports:
+      - "5432:5432"
+    profiles: ["postgres", "staging"]
+
+  api:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql+psycopg://crossing:crossing@postgres:5432/crossing
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+    command:
+      [
+        "uvicorn",
+        "crossing.api:app",
+        "--host",
+        "0.0.0.0",
+        "--port",
+        "8000",
+        "--timeout-graceful-shutdown",
+        "30",
+      ]
+    profiles: ["staging"]
+
+  worker:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    env_file:
+      - .env
+    environment:
+      DATABASE_URL: postgresql+psycopg://crossing:crossing@postgres:5432/crossing
+    depends_on:
+      postgres:
+        condition: service_healthy
+    command: ["python", "-m", "crossing.worker"]
+    profiles: ["staging"]
+
+  caddy:
+    image: caddy:2-alpine
+    volumes:
+      - ./Caddyfile:/etc/caddy/Caddyfile:ro
+    ports:
+      - "80:80"
+    depends_on:
+      - api
+    profiles: ["caddy", "staging"]
 
 volumes:
   crossing_pg:
