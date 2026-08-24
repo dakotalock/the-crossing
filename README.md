@@ -14,9 +14,13 @@ PYTHONPATH=. python -m crossing.demo
 uvicorn crossing.api:app --reload
 ```
 
-Production refuses a missing `CROSSING_ED25519_SEED` (64 hex chars) unless `CROSSING_ALLOW_DEV=1`.
+Production refuses a missing `CROSSING_ED25519_SEED` (64 hex chars) and a missing `CROSSING_KEY_PEPPER` unless `CROSSING_ALLOW_DEV=1`.
 
-HTTP routes authenticate with header `X-API-Key` matching `CROSSING_API_KEY` (prototype: one global key). Query-string `?key=` auth was removed so the secret does not leak into history, access logs, or `Referer`. When `CROSSING_ALLOW_DEV=1` and `CROSSING_API_KEY` is unset, the default test key is `dev` and a missing header is accepted on API routes except `GET /` (dashboard always requires `X-API-Key`). Unauthenticated minting is forbidden when `ALLOW_DEV` is off. This single shared key is prototype-only; marketplace-scoped credentials are not in this round.
+HTTP routes authenticate with header `X-API-Key` carrying a **tenant API key**. Secrets are shown once at creation; only `hmac-sha256(pepper, secret)` is stored. Visible prefix looks like `cxk_live_xxxx` / `cxk_test_xxxx` plus a public key id. Lookup is by prefix; compare is constant-time on hashes. Every resource query is filtered by the authenticated account/principal (wrong UUID → 404 closed). Dashboard accepts `X-API-Key` or the `crossing_session` cookie — never `?key=`. CORS defaults to deny (no `*`); set `CROSSING_CORS_ORIGINS` for explicit origins.
+
+When `CROSSING_ALLOW_DEV=1`, boot mints a bootstrap **admin** key whose raw secret is `dev` (hash only stored). Production does not use a global `CROSSING_API_KEY`. Unauthenticated minting is forbidden.
+
+Crossing budgets are **authorization limits, not custody**. There are no marketplace payouts. Charge customers for using the control plane.
 
 ## Architecture
 
@@ -77,8 +81,7 @@ Out of scope for this MVP:
 - Hardware key custody (seed is an env var)
 - Network-level MCP attestation of upstream servers
 - Exactly-once execution at vendor / upstream MCP (Crossing forwards `invocation_id` / `idempotency_key` to the mock provider; it only guarantees at-most-one *dispatch from Crossing*)
-- Marketplace-scoped API credentials (one global `CROSSING_API_KEY` is prototype-only)
-- Real-money / production payment readiness
+- Real-money / production payment readiness (this is still not D)
 - Legal enforceability of a mandate in any jurisdiction
 
 ## HTTP
@@ -90,6 +93,9 @@ Out of scope for this MVP:
 - `POST /v1/mandates` `GET /v1/mandates/{id}`
 - `POST /v1/invoke` (deny events are committed, then 403)
 - `GET /v1/receipts` `GET /v1/receipts/{id}`
+- `POST /v1/keys` `POST /v1/keys/{id}/rotate` `POST /v1/keys/{id}/revoke` (raw secret returned once)
+- `POST /v1/mandates/{id}/revoke`
+- `POST /v1/invocations/{id}/reconcile` (`outcome=committed|released`, `evidence_ref` required)
 
 ## Receipts
 
@@ -125,26 +131,50 @@ Install `psycopg[binary]` (listed in `requirements.txt`) and set `DATABASE_URL=p
 
 The mandate debit, child escrow, and reservation terminal transitions are conditional updates (SQLite and Postgres). Local default is still SQLite. CI has a `postgres` job (`DATABASE_URL=postgresql+psycopg://…`). That is not multi-host consensus.
 
+## Alembic
+
+`alembic.ini` + `alembic/versions/` ship an initial migration matching current models (including `accounts`, `api_keys`, `reconciliation_events`).
+
+- Dev (`CROSSING_ALLOW_DEV=1`): sqlite may `create_all` **or** `alembic upgrade head`.
+- Production (`CROSSING_ALLOW_DEV!=1`): **do not** `create_all`. Apply migrations before boot (`alembic upgrade head`). API/worker refuse to start if required tables are missing.
+
+`alembic/env.py` reads `DATABASE_URL` the same way as `crossing/db.py`.
+
+## Reconciliation
+
+Operator CAS (never overwrite committed/released; lost CAS is a no-op returning current):
+
+```
+UPDATE invocations SET status='reconciled_committed'
+ WHERE id=:id AND status IN ('ambiguous','executed_fail') RETURNING …
+UPDATE invocations SET status='reconciled_released'
+ WHERE id=:id AND status IN ('ambiguous','executed_fail') RETURNING …
+```
+
+`reconciled_committed` applies the same economic effects as `finalize_success` (receipt + outbox + claim completed) **exactly once**; a prior success is not double-billed. `reconciled_released` refunds remaining exactly once (`held→released` CAS). LogicalOperation is cleared only when evidence says execution **did not** occur. Evidence `did_execute` cannot use the released path. `evidence_ref` is required; actor is the API key id. Historical attempts are never deleted.
+
+Provider exactly-once is **not** guaranteed without reconcil evidence. Crossing still only guarantees at-most-one *dispatch from Crossing*.
+
 ## Review r8 (honest)
 
 - Transitions **to** `ambiguous` are CAS (`reserved→ambiguous` or `executing→ambiguous`). A lost CAS refreshes and returns the winner; recovery does not refund or clear the claim on the ambiguous path.
 - Terminal invocation states (`committed`, `released`, `executed_fail`, `ambiguous`) are monotonic: `recover_reserved` and `mark_executing` (still only `reserved→executing`) will not overwrite them.
 - `finalize_success` requires the durable executing barrier (`executing`, or `executed_ok` if used). Calling it on `reserved` returns `won=False` with no receipt and no reservation commit.
-- Still one global `CROSSING_API_KEY` (prototype-only).
-- Still cannot prove vendor exactly-once without provider idempotency. Crossing only guarantees at-most-one *dispatch from Crossing*.
-- Still not real-money-ready.
+- Tenant-scoped hashed API keys (not a global `CROSSING_API_KEY`). Still not a marketplace.
+- Still cannot prove vendor exactly-once without provider idempotency / reconcil evidence. Crossing only guarantees at-most-one *dispatch from Crossing*.
+- Still not real-money-ready. Still not D. Still no custody.
 
 ## Review r7 (kept)
 
 - `executing` is CAS + COMMIT **before** provider I/O. Recovery will not auto-refund `executing`. A provider exception after dispatch is `executed_fail` (no refund, claim stays). `reserved` (never dispatched) is still releasable.
 - Still cannot prove vendor exactly-once without provider idempotency. Crossing only guarantees at-most-one *dispatch from Crossing*.
-- Still one global `CROSSING_API_KEY` (prototype-only).
+- Tenant hashed keys; still not a marketplace.
 - Still not real-money-ready.
 
 ## Review r6 (kept)
 
 - `finalize_success` / `finalize_release` own the whole ending: reservation CAS, invocation, receipt, outbox, claim, and ledger event share one savepoint. A lost CAS does nothing else. `commit()` / `release()` remain low-level reservation helpers.
-- Still one global `CROSSING_API_KEY` (prototype-only).
+- Tenant hashed keys; still not a marketplace.
 - Still at-most-one Crossing dispatch, not provider exactly-once.
 - Still not real-money-ready.
 
