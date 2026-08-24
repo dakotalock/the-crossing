@@ -10,7 +10,7 @@ from sqlalchemy import case, or_, select, update
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
-from crossing.models import IdempotencyRecord, Invocation, LedgerEvent, Mandate, Reservation, new_id
+from crossing.models import IdempotencyRecord, Invocation, LedgerEvent, Mandate, Receipt, ReconciliationEvent, Reservation, new_id
 from crossing.policy import PolicyDenied, Reason
 
 
@@ -288,7 +288,7 @@ class FinalizeResult:
     outbox: Any = None
 
 
-TERMINAL_INVOCATION = ("committed", "released", "executed_fail", "ambiguous")
+TERMINAL_INVOCATION = ("committed", "released", "executed_fail", "ambiguous", "reconciled_committed", "reconciled_released")
 
 
 @dataclass
@@ -636,3 +636,257 @@ def release(session: Session, reservation: Reservation, *, task_id: str | None =
     )
     session.flush()
     return reservation
+
+
+RECONCILE_COMMIT_FROM = ("ambiguous", "executed_fail")
+RECONCILE_RELEASE_FROM = ("ambiguous", "executed_fail")
+EVIDENCE_DID_EXECUTE = "did_execute"
+EVIDENCE_DID_NOT_EXECUTE = "did_not_execute"
+
+
+class ReconcileResult:
+    def __init__(
+        self,
+        *,
+        won: bool,
+        invocation: Invocation,
+        reservation: Reservation | None = None,
+        event: ReconciliationEvent | None = None,
+        receipt: object | None = None,
+        outbox: object | None = None,
+    ) -> None:
+        self.won = won
+        self.invocation = invocation
+        self.reservation = reservation
+        self.event = event
+        self.receipt = receipt
+        self.outbox = outbox
+
+
+def _require_evidence(evidence_ref: str, evidence_kind: str) -> None:
+    if not (evidence_ref or "").strip():
+        raise PolicyDenied(Reason.UNAUTHORIZED, "evidence_ref is required")
+    if evidence_kind not in (EVIDENCE_DID_EXECUTE, EVIDENCE_DID_NOT_EXECUTE):
+        raise PolicyDenied(Reason.UNAUTHORIZED, "evidence_kind must be did_execute or did_not_execute")
+
+
+def _append_reconciliation(
+    session: Session,
+    invocation: Invocation,
+    *,
+    from_status: str,
+    to_status: str,
+    actor: str,
+    evidence_ref: str,
+    evidence_kind: str,
+) -> ReconciliationEvent:
+    ev = ReconciliationEvent(
+        id=new_id(),
+        invocation_id=invocation.id,
+        from_status=from_status,
+        to_status=to_status,
+        actor=actor,
+        evidence_ref=evidence_ref.strip(),
+        evidence_kind=evidence_kind,
+    )
+    session.add(ev)
+    session.flush()
+    return ev
+
+
+def _receipt_for_reservation(session: Session, reservation_id: str | None) -> Receipt | None:
+    if not reservation_id:
+        return None
+    return session.scalar(select(Receipt).where(Receipt.reservation_id == reservation_id))
+
+
+def _apply_success_economics(
+    session: Session,
+    reservation: Reservation,
+    invocation: Invocation,
+    *,
+    receipt_fn=None,
+    billing_fn=None,
+    result_json: str | None = None,
+) -> tuple[object | None, object | None]:
+    """Commit reservation + receipt/outbox/claim exactly once. Idempotent if already billed."""
+    receipt = _receipt_for_reservation(session, reservation.id)
+    outbox = None
+    if reservation.status == "committed":
+        if receipt is None and receipt_fn is not None:
+            receipt = receipt_fn(session)
+            if billing_fn is not None and receipt is not None:
+                outbox = billing_fn(session, receipt)
+        _complete_logical_operation(session, invocation, result_json)
+        return receipt, outbox
+    if reservation.status != "held":
+        raise _FinalizeLost()
+    if not _cas_reservation(session, reservation, "committed"):
+        raise _FinalizeLost()
+    m = session.get(Mandate, reservation.mandate_id)
+    remaining = m.remaining_cents if m else None
+    append_event(
+        session,
+        principal_id=reservation.principal_id,
+        mandate_id=reservation.mandate_id,
+        kind="commit",
+        amount_cents=reservation.amount_cents,
+        remaining_after=remaining,
+        reservation_id=reservation.id,
+        idempotency_key=reservation.idempotency_key,
+        task_id=invocation.task_id,
+    )
+    if receipt is None and receipt_fn is not None:
+        receipt = receipt_fn(session)
+    if billing_fn is not None and receipt is not None:
+        outbox = billing_fn(session, receipt)
+    _complete_logical_operation(session, invocation, result_json)
+    return receipt, outbox
+
+
+def reconcile_commit(
+    session: Session,
+    invocation: Invocation,
+    *,
+    actor: str,
+    evidence_ref: str,
+    evidence_kind: str,
+    receipt_fn=None,
+    billing_fn=None,
+    result_json: str | None = None,
+    commit_txn: bool = True,
+) -> ReconcileResult:
+    """CAS ambiguous|executed_fail → reconciled_committed. Same economics as finalize_success once.
+
+    If already billed (reservation committed / receipt exists), do not double-bill.
+    Never overwrite committed/released. Lost CAS is a no-op returning current.
+    """
+    _require_evidence(evidence_ref, evidence_kind)
+    reservation = session.get(Reservation, invocation.reservation_id) if invocation.reservation_id else None
+    from_status = invocation.status
+    receipt = None
+    outbox = None
+    event = None
+    try:
+        with session.begin_nested():
+            if reservation is not None and reservation.status == "released":
+                raise _FinalizeLost()
+            if not _cas_invocation(
+                session,
+                invocation,
+                allowed=RECONCILE_COMMIT_FROM,
+                new_status="reconciled_committed",
+            ):
+                raise _FinalizeLost()
+            if reservation is None:
+                raise _FinalizeLost()
+            session.refresh(reservation)
+            if reservation.status == "released":
+                raise _FinalizeLost()
+            receipt, outbox = _apply_success_economics(
+                session,
+                reservation,
+                invocation,
+                receipt_fn=receipt_fn,
+                billing_fn=billing_fn,
+                result_json=result_json,
+            )
+            event = _append_reconciliation(
+                session,
+                invocation,
+                from_status=from_status,
+                to_status="reconciled_committed",
+                actor=actor,
+                evidence_ref=evidence_ref,
+                evidence_kind=evidence_kind,
+            )
+    except _FinalizeLost:
+        session.refresh(invocation)
+        if reservation is not None:
+            session.refresh(reservation)
+        return ReconcileResult(won=False, invocation=invocation, reservation=reservation)
+    if commit_txn:
+        session.commit()
+    else:
+        session.flush()
+    return ReconcileResult(
+        won=True,
+        invocation=invocation,
+        reservation=reservation,
+        event=event,
+        receipt=receipt,
+        outbox=outbox,
+    )
+
+
+def reconcile_release(
+    session: Session,
+    invocation: Invocation,
+    *,
+    actor: str,
+    evidence_ref: str,
+    evidence_kind: str,
+    commit_txn: bool = True,
+) -> ReconcileResult:
+    """CAS ambiguous|executed_fail → reconciled_released. Refund remaining exactly once.
+
+    If evidence is did_execute, refuse this path. Clear LogicalOperation only when
+    evidence says execution DID NOT occur. Never overwrite committed/released.
+    """
+    _require_evidence(evidence_ref, evidence_kind)
+    if evidence_kind == EVIDENCE_DID_EXECUTE:
+        raise PolicyDenied(Reason.UNAUTHORIZED, "did_execute evidence cannot use reconciled_released")
+    reservation = session.get(Reservation, invocation.reservation_id) if invocation.reservation_id else None
+    from_status = invocation.status
+    event = None
+    try:
+        with session.begin_nested():
+            if reservation is not None and reservation.status == "committed":
+                raise _FinalizeLost()
+            if not _cas_invocation(
+                session,
+                invocation,
+                allowed=RECONCILE_RELEASE_FROM,
+                new_status="reconciled_released",
+            ):
+                raise _FinalizeLost()
+            if reservation is None:
+                raise _FinalizeLost()
+            session.refresh(reservation)
+            if reservation.status == "committed":
+                raise _FinalizeLost()
+            if not _cas_reservation(session, reservation, "released"):
+                raise _FinalizeLost()
+            remaining = _refund_mandate(session, reservation)
+            append_event(
+                session,
+                principal_id=reservation.principal_id,
+                mandate_id=reservation.mandate_id,
+                kind="release",
+                amount_cents=reservation.amount_cents,
+                remaining_after=remaining,
+                reservation_id=reservation.id,
+                idempotency_key=reservation.idempotency_key,
+                task_id=invocation.task_id,
+            )
+            if evidence_kind == EVIDENCE_DID_NOT_EXECUTE:
+                _clear_logical_operation(session, invocation)
+            event = _append_reconciliation(
+                session,
+                invocation,
+                from_status=from_status,
+                to_status="reconciled_released",
+                actor=actor,
+                evidence_ref=evidence_ref,
+                evidence_kind=evidence_kind,
+            )
+    except _FinalizeLost:
+        session.refresh(invocation)
+        if reservation is not None:
+            session.refresh(reservation)
+        return ReconcileResult(won=False, invocation=invocation, reservation=reservation)
+    if commit_txn:
+        session.commit()
+    else:
+        session.flush()
+    return ReconcileResult(won=True, invocation=invocation, reservation=reservation, event=event)
