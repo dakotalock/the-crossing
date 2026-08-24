@@ -271,3 +271,128 @@ def test_atomic_debit_refuses_overspend(seeded):
         s.refresh(mandate)
         assert mandate.remaining_cents == 100
         assert mandate.calls_used == 0
+
+
+
+def test_mark_executing_commits_before_provider(seeded, monkeypatch):
+    """Provider sees a durable executing row; no I/O if mark_executing did not commit."""
+    from crossing import mock_mcp
+    from crossing.models import Invocation
+
+    cx, _, _, m = seeded
+    seen: dict[str, str] = {}
+    provider_calls: list[int] = []
+
+    def hook(_args, **ids):
+        provider_calls.append(1)
+        with db.session_scope() as s2:
+            inv = s2.get(Invocation, ids["invocation_id"])
+            seen["status"] = inv.status if inv is not None else "missing"
+        return {"hits": [{"title": "ok"}]}
+
+    mock_mcp.HOOKS["search"] = hook
+    try:
+        r = cx.invoke(m.id, "search", {"q": "exec"}, idempotency_key="exec-before")
+        assert r.ok
+        assert seen["status"] == "executing"
+        assert provider_calls == [1]
+    finally:
+        mock_mcp.HOOKS.clear()
+
+    lost_calls: list[int] = []
+
+    def lose(_session, invocation):
+        return ledger.MarkExecutingResult(won=False, invocation=invocation, reason="IN_PROGRESS")
+
+    def would_call(_args, **_ids):
+        lost_calls.append(1)
+        return {"hits": []}
+
+    monkeypatch.setattr(ledger, "mark_executing", lose)
+    mock_mcp.HOOKS["search"] = would_call
+    try:
+        r2 = cx.invoke(m.id, "search", {"q": "no-dispatch"}, idempotency_key="exec-lost")
+        assert r2.ok is False
+        assert r2.reason == "IN_PROGRESS"
+        assert lost_calls == []
+    finally:
+        mock_mcp.HOOKS.clear()
+
+
+def test_recovery_cannot_release_in_flight_execution(seeded):
+    """recover_reserved(mode=release) must not refund an executing dispatch."""
+    import threading
+
+    from crossing import mock_mcp
+    from crossing.models import IdempotencyRecord, Invocation, Mandate, Reservation
+
+    cx, _, _, m = seeded
+    dispatch_visible = threading.Event()
+    allow_finish = threading.Event()
+    inv_box: dict[str, str] = {}
+    result_box: dict = {}
+
+    def hook(_args, **ids):
+        inv_box["id"] = ids["invocation_id"]
+        dispatch_visible.set()
+        if not allow_finish.wait(timeout=10):
+            raise RuntimeError("provider not unblocked")
+        return {"hits": [{"title": "late"}]}
+
+    mock_mcp.HOOKS["search"] = hook
+    try:
+        def runner() -> None:
+            result_box["r"] = cx.invoke(m.id, "search", {"q": "inflight"}, idempotency_key="inflight-1")
+
+        t = threading.Thread(target=runner)
+        t.start()
+        assert dispatch_visible.wait(timeout=5)
+
+        with cx.session() as s:
+            inv = s.get(Invocation, inv_box["id"])
+            assert inv is not None
+            assert inv.status == "executing"
+            out = ledger.recover_reserved(s, inv, mode="release")
+            assert out.status in ("executing", "executed_fail")
+            assert out.status != "released"
+
+        assert cx.remaining(m.id) == 95
+        with cx.session() as s:
+            inv = s.get(Invocation, inv_box["id"])
+            assert inv.status in ("executing", "executed_fail")
+            assert inv.status != "released"
+            hold = s.get(Reservation, inv.reservation_id)
+            assert hold.status == "held"
+            claim = s.query(IdempotencyRecord).filter_by(idempotency_key="inflight-1").one()
+            assert claim.status == "in_progress"
+            assert s.get(Mandate, m.id).remaining_cents == 95
+
+        allow_finish.set()
+        t.join(timeout=10)
+        assert result_box["r"].ok
+        assert cx.remaining(m.id) == 95
+        with cx.session() as s:
+            inv = s.get(Invocation, inv_box["id"])
+            assert inv.status == "committed"
+    finally:
+        allow_finish.set()
+        mock_mcp.HOOKS.clear()
+
+
+def test_reserved_still_releasable_if_never_dispatched(seeded):
+    """reserve_and_commit only — recover release still refunds and clears claim."""
+    cx, _, _, m = seeded
+    with cx.session() as s:
+        mandate = load_live_mandate(s, m.id)
+        _res, inv = ledger.reserve_and_commit(
+            s, mandate, 5, idempotency_key="never-dispatch", tool="search", server="mock"
+        )
+        inv_id = inv.id
+    assert cx.remaining(m.id) == 95
+    with cx.session() as s:
+        inv = s.get(Invocation, inv_id)
+        assert inv.status == "reserved"
+        out = ledger.recover_reserved(s, inv, mode="release")
+        assert out.status == "released"
+        assert s.query(IdempotencyRecord).filter_by(idempotency_key="never-dispatch").count() == 0
+    assert cx.remaining(m.id) == 100
