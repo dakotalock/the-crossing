@@ -1,10 +1,11 @@
-"""Stripe adapter. HTTP happens only in drain_outbox(), after the ledger commit."""
+"""Stripe adapter. HTTP happens only in drain_outbox() / the worker, after COMMIT."""
 
 from __future__ import annotations
 
 import hashlib
 import hmac
 import json
+import logging
 import os
 import time
 from datetime import timedelta
@@ -13,9 +14,14 @@ from typing import Any
 import httpx
 from sqlalchemy import and_, or_, select, update
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, object_session
 
 from crossing.models import Account, Outbox, Principal, StripeEvent, new_id, utcnow
+from crossing.policy import PolicyDenied, Reason
+
+log = logging.getLogger("crossing.billing")
+
+UNPAID_STATUSES = frozenset({"unpaid", "canceled", "cancelled", "incomplete_expired"})
 
 STRIPE_API = "https://api.stripe.com/v1"
 MAX_ATTEMPTS = 8
@@ -48,6 +54,37 @@ def fee_bps() -> int:
     return max(0, n)
 
 
+def warn_unsent_fees() -> None:
+    """Fees are accumulated locally; Stripe has no fee line until one is wired."""
+    if fee_bps() != 0:
+        log.warning(
+            "CROSSING_FEE_BPS is non-zero but post_stripe does not send a fee line; "
+            "keep CROSSING_FEE_BPS=0 until a Stripe invoice item exists. "
+            "Microcents accumulate on the account only."
+        )
+
+
+def is_billable(account: Account | None) -> bool:
+    """When STRIPE_SECRET_KEY is set, paid work requires a live customer on the account."""
+    if not configured():
+        return True
+    if account is None:
+        return False
+    if not (account.stripe_customer_id or "").strip():
+        return False
+    st = (account.stripe_status or "").strip().lower()
+    if st in UNPAID_STATUSES:
+        return False
+    return True
+
+
+def require_billable(session: Session, principal_id: str) -> Account | None:
+    account = _account_for_principal(session, principal_id)
+    if not is_billable(account):
+        raise PolicyDenied(Reason.BILLING_REQUIRED, "stripe customer required for paid work")
+    return account
+
+
 def fee_microcents_for(amount_cents: int, bps: int | None = None) -> int:
     """Integer microcents (1e-6 of a cent). Never float. 4bps of 1 cent stays 400 microcents."""
     b = fee_bps() if bps is None else int(bps)
@@ -59,13 +96,25 @@ def fee_microcents_for(amount_cents: int, bps: int | None = None) -> int:
 
 
 def apply_platform_fee(account: Account, amount_cents: int) -> int:
-    """Accumulate fee microcents; return newly invoiceable whole cents (>= 1 cent)."""
-    add = fee_microcents_for(amount_cents)
+    """Accumulate integer fee microcents only. Never claim invoiced cents Stripe did not receive.
+
+    Returns 0 always (no Stripe fee line). fee_invoiced_cents is not mutated.
+    """
+    add = int(fee_microcents_for(amount_cents))
+    if add <= 0:
+        return 0
+    sess = object_session(account)
+    if sess is not None and account.id:
+        sess.execute(
+            update(Account)
+            .where(Account.id == account.id)
+            .values(fee_microcents=Account.fee_microcents + add)
+        )
+        sess.flush()
+        sess.refresh(account)
+        return 0
     account.fee_microcents = int(account.fee_microcents or 0) + add
-    invoice = account.fee_microcents // MICRO_PER_CENT
-    account.fee_microcents = account.fee_microcents % MICRO_PER_CENT
-    account.fee_invoiced_cents = int(account.fee_invoiced_cents or 0) + invoice
-    return invoice
+    return 0
 
 
 def _account_for_principal(session: Session, principal_id: str) -> Account | None:
@@ -92,13 +141,14 @@ def enqueue(
         if account is not None and account.stripe_customer_id:
             customer_id = account.stripe_customer_id
         else:
-            customer_id = os.environ.get("STRIPE_CUSTOMER_ID") or None
+            customer_id = None
     payload = {
         "receipt_id": receipt_id,
         "amount_cents": int(amount_cents),
         "principal_id": principal_id,
         "customer_id": customer_id,
         "fee_bps": fee_bps(),
+        # Never claim invoiced fees that were not sent to Stripe.
         "platform_fee_invoice_cents": 0,
     }
     row = Outbox(
@@ -176,23 +226,27 @@ def _mark_fail(row: Outbox, error: str) -> None:
         row.next_attempt_at = utcnow() + timedelta(minutes=backoff_minutes(row.attempts))
 
 
-def flush_row(session: Session, row: Outbox) -> Outbox:
-    payload = json.loads(row.payload_json)
-    row.attempts += 1
+def _apply_stripe_result(row: Outbox, result: dict[str, Any]) -> None:
+    row.attempts = int(row.attempts or 0) + 1
     row.claimed_at = utcnow()
-    session.flush()
+    if result.get("noop"):
+        row.status = "noop"
+        row.last_error = None
+    elif result.get("ok"):
+        row.status = "sent"
+        row.last_error = None
+    else:
+        _mark_fail(row, str(result.get("error") or "stripe failed"))
+
+
+def flush_row(session: Session, row: Outbox) -> Outbox:
+    """HTTP for an already-claimed sending row. Caller must have COMMITTED sending first."""
+    payload = json.loads(row.payload_json)
     try:
         result = post_stripe(payload)
-        if result.get("noop"):
-            row.status = "noop"
-            row.last_error = None
-        elif result.get("ok"):
-            row.status = "sent"
-            row.last_error = None
-        else:
-            _mark_fail(row, str(result.get("error") or "stripe failed"))
     except Exception as exc:  # noqa: BLE001 — adapter must never raise into commit
-        _mark_fail(row, exc.__class__.__name__)
+        result = {"ok": False, "stripe_reported": False, "error": exc.__class__.__name__}
+    _apply_stripe_result(row, result)
     session.flush()
     return row
 
@@ -242,25 +296,59 @@ def report_after_commit(session: Session, row: Outbox) -> Outbox:
 
 
 def drain_outbox(session: Session | None = None, *, limit: int = 50) -> list[Outbox]:
-    """Send pending billing_outbox rows. Stripe failure leaves ledger intact."""
+    """Claim sending + COMMIT, then HTTP, then CAS sending→terminal + COMMIT.
+
+    Never HTTP in the same uncommitted transaction as the first claim.
+    Stripe Idempotency-Key is receipt_id so a crash after HTTP before sent is retried safely.
+    """
     from crossing import db
 
     own = session is None
     if own:
         session = db.get_session()
     assert session is not None
+    processed: list[Outbox] = []
     try:
-        rows = _claim_outbox_rows(session, limit=limit)
-        for row in rows:
-            flush_row(session, row)
+        claimed = _claim_outbox_rows(session, limit=limit)
+        jobs = [(row.id, json.loads(row.payload_json)) for row in claimed]
         session.commit()
-        return rows
+        for oid, payload in jobs:
+            try:
+                result = post_stripe(payload)
+            except Exception as exc:  # noqa: BLE001
+                result = {"ok": False, "stripe_reported": False, "error": exc.__class__.__name__}
+            row = session.get(Outbox, oid)
+            if row is None or row.status != "sending":
+                session.rollback()
+                continue
+            _apply_stripe_result(row, result)
+            session.commit()
+            session.refresh(row)
+            processed.append(row)
+        return processed
     except Exception:
         session.rollback()
         raise
     finally:
         if own:
             session.close()
+
+
+def requeue_dead(session: Session, outbox_id: str | None = None) -> list[Outbox]:
+    """Admin: dead → pending so the worker may claim again. Does not touch the ledger."""
+    q = select(Outbox).where(Outbox.status == "dead")
+    if outbox_id:
+        q = q.where(Outbox.id == outbox_id)
+    rows = list(session.scalars(q).all())
+    now = utcnow()
+    out: list[Outbox] = []
+    for row in rows:
+        row.status = "pending"
+        row.next_attempt_at = now
+        row.last_error = row.last_error
+        out.append(row)
+    session.flush()
+    return out
 
 
 def verify_webhook_signature(
@@ -388,8 +476,15 @@ def attach_stripe_customer(session: Session, account_id: str, stripe_customer_id
     acct = session.get(Account, account_id)
     if acct is None:
         raise KeyError(account_id)
-    acct.stripe_customer_id = stripe_customer_id
-    session.flush()
+    try:
+        with session.begin_nested():
+            acct.stripe_customer_id = stripe_customer_id
+            session.flush()
+    except IntegrityError as exc:
+        raise PolicyDenied(
+            Reason.UNAUTHORIZED,
+            "stripe_customer_id already bound to another account",
+        ) from exc
     return acct
 
 
