@@ -9,15 +9,18 @@ from sqlalchemy import select
 from sqlalchemy.orm import Session
 
 from crossing import crypto
-from crossing.identity import require_live_agent
-from crossing.models import LedgerEvent, Mandate, UsedNonce, new_id, utcnow
+from crossing.identity import is_self_or_descendant, require_live_agent
+from crossing.models import LedgerEvent, Mandate, Principal, UsedNonce, new_id
 from crossing.policy import (
     PolicyDenied,
     Reason,
     as_utc,
+    bound_pubkeys,
     check_child_attenuation,
     check_fresh,
     check_mandate_signature,
+    check_non_negative_money,
+    check_signed_state,
 )
 
 
@@ -39,6 +42,11 @@ def mandate_payload(
     max_subagent_budget_cents: int | None,
     nonce: str,
 ) -> dict[str, Any]:
+    """Immutable signed fields only.
+
+    remaining_cents and calls_used are mutable accounting and MUST NOT be signed.
+    remaining starts equal to signed spend_limit_cents.
+    """
     exp = as_utc(expires_at)
     return {
         "v": 1,
@@ -54,6 +62,27 @@ def mandate_payload(
         "max_subagent_budget_cents": max_subagent_budget_cents,
         "nonce": nonce,
     }
+
+
+def _verify_caller_signature(
+    session: Session,
+    *,
+    principal_id: str,
+    payload: dict[str, Any],
+    signature: str,
+    pubkey_hex: str | None,
+) -> str:
+    """Return the bound pubkey used to verify. Never trust a request pubkey unless bound."""
+    principal = session.get(Principal, principal_id)
+    issuer = crypto.pubkey_hex()
+    allowed = bound_pubkeys(principal, issuer)
+    if pubkey_hex is not None and pubkey_hex not in allowed:
+        raise PolicyDenied(Reason.MANDATE_FORGED, "request pubkey is not bound to the principal")
+    registered = principal.pubkey_hex if principal is not None else None
+    verify_key = registered if registered else issuer
+    if not crypto.verify_obj(payload, signature, verify_key):
+        raise PolicyDenied(Reason.MANDATE_FORGED, "caller signature rejected")
+    return verify_key
 
 
 def issue_mandate(
@@ -74,17 +103,21 @@ def issue_mandate(
     pubkey_hex: str | None = None,
     verify: bool = True,
 ) -> Mandate:
-    require_live_agent(session, agent_id)
-    nonce = nonce or secrets.token_hex(16)
-    existing = session.scalar(select(UsedNonce).where(UsedNonce.principal_id == principal_id, UsedNonce.nonce == nonce))
-    if existing is not None:
-        raise PolicyDenied(Reason.NONCE_REPLAY, nonce)
-    session.add(UsedNonce(id=new_id(), principal_id=principal_id, nonce=nonce))
+    check_non_negative_money(
+        spend_limit_cents=spend_limit_cents,
+        max_call_cents=max_call_cents,
+        max_subagent_budget_cents=max_subagent_budget_cents,
+        remaining_cents=spend_limit_cents,
+    )
+    agent = require_live_agent(session, agent_id)
+    if agent.principal_id != principal_id:
+        raise PolicyDenied(Reason.AGENT_PRINCIPAL_MISMATCH, "agent is not bound to principal")
 
     if max_call_cents is None:
         max_call_cents = spend_limit_cents
     if max_subagent_budget_cents is None:
         max_subagent_budget_cents = spend_limit_cents
+    check_non_negative_money(max_call_cents=max_call_cents, max_subagent_budget_cents=max_subagent_budget_cents)
 
     parent = None
     if parent_mandate_id:
@@ -92,8 +125,13 @@ def issue_mandate(
         if parent is None:
             raise PolicyDenied(Reason.MANDATE_REVOKED, "parent mandate missing")
         if verify:
-            check_mandate_signature(parent, crypto.verify_obj)
+            _verify_stored_mandate(session, parent)
         check_fresh(parent)
+        if not is_self_or_descendant(session, agent_id, parent.agent_id):
+            raise PolicyDenied(
+                Reason.CHILD_AGENT_NOT_DESCENDANT,
+                "child agent is not the parent agent or a descendant",
+            )
         check_child_attenuation(
             parent,
             spend_limit_cents=spend_limit_cents,
@@ -103,6 +141,14 @@ def issue_mandate(
             expires_at=expires_at,
             max_subagent_budget_cents=max_subagent_budget_cents,
         )
+
+    nonce = nonce or secrets.token_hex(16)
+    existing = session.scalar(
+        select(UsedNonce).where(UsedNonce.principal_id == principal_id, UsedNonce.nonce == nonce)
+    )
+    if existing is not None:
+        raise PolicyDenied(Reason.NONCE_REPLAY, nonce)
+    session.add(UsedNonce(id=new_id(), principal_id=principal_id, nonce=nonce))
 
     payload = mandate_payload(
         principal_id=principal_id,
@@ -117,11 +163,25 @@ def issue_mandate(
         max_subagent_budget_cents=max_subagent_budget_cents,
         nonce=nonce,
     )
+
+    # Root mandates are signed ONLY by The Crossing issuer key unless a principal
+    # key is registered and the caller proved possession of it. Request pubkeys
+    # are never a trust root.
     if signature is None:
-        signature = crypto.sign_obj(payload)
-        pubkey_hex = crypto.pubkey_hex()
-    elif pubkey_hex is None:
-        pubkey_hex = crypto.pubkey_hex()
+        stored_sig = crypto.sign_obj(payload)
+        stored_pub = crypto.pubkey_hex()
+    elif verify:
+        stored_pub = _verify_caller_signature(
+            session,
+            principal_id=principal_id,
+            payload=payload,
+            signature=signature,
+            pubkey_hex=pubkey_hex,
+        )
+        stored_sig = signature
+    else:
+        stored_sig = signature
+        stored_pub = pubkey_hex or crypto.pubkey_hex()
 
     m = Mandate(
         id=new_id(),
@@ -138,13 +198,13 @@ def issue_mandate(
         expires_at=as_utc(expires_at),
         max_subagent_budget_cents=max_subagent_budget_cents,
         nonce=nonce,
-        signature=signature,
-        pubkey_hex=pubkey_hex,
+        signature=stored_sig,
+        pubkey_hex=stored_pub,
         payload_json=_dumps(payload),
         revoked=False,
     )
     if verify:
-        check_mandate_signature(m, crypto.verify_obj)
+        _verify_stored_mandate(session, m)
 
     session.add(m)
     session.flush()
@@ -166,12 +226,20 @@ def issue_mandate(
     return m
 
 
+def _verify_stored_mandate(session: Session, mandate: Mandate) -> None:
+    principal = session.get(Principal, mandate.principal_id)
+    issuer = crypto.pubkey_hex()
+    allowed = bound_pubkeys(principal, issuer)
+    check_mandate_signature(mandate, crypto.verify_obj, allowed_pubkeys=allowed)
+    check_signed_state(mandate)
+
+
 def load_live_mandate(session: Session, mandate_id: str, *, verify: bool = True) -> Mandate:
     m = session.get(Mandate, mandate_id)
     if m is None:
         raise PolicyDenied(Reason.MANDATE_REVOKED, "mandate missing")
     if verify:
-        check_mandate_signature(m, crypto.verify_obj)
+        _verify_stored_mandate(session, m)
     check_fresh(m)
     require_live_agent(session, m.agent_id)
     return m
