@@ -27,7 +27,6 @@ def test_ten_threads_cannot_overspend(cx):
         )
         mid, pid = m.id, p.id
 
-    # Monkeypatch price for this test via mock + pricing
     from crossing import pricing
 
     pricing.PRICES_CENTS[("mock", "search")] = 20
@@ -154,7 +153,6 @@ def test_same_idempotency_key_one_execution(cx):
         assert len(holds) == 1
         claims = s.query(IdempotencyRecord).all()
         assert len(claims) == 1
-    # loser is in-progress, replay, or a wait-or-conflict deny — not a second execute
     if others:
         o = others[0]
         if getattr(o, "ok", None) is False:
@@ -420,6 +418,11 @@ def test_finalize_success_vs_recover_release_one_universe(cx):
         try:
             hold = session.get(Reservation, rid)
             invocation = session.get(Invocation, iid)
+            marked = ledger.mark_executing(session, invocation)
+            if not marked.won:
+                with lock:
+                    outcomes.append(("success", False))
+                return
 
             def receipt_fn(s):
                 return receipts.issue(
@@ -500,9 +503,177 @@ def test_finalize_success_vs_recover_release_one_universe(cx):
             assert remaining == original
             assert mandate.remaining_cents == original
             assert mandate.calls_used == 0
-        # Never both billed and refunded; never committed hold + cleared claim.
         billed = outbox_n > 0
         refunded = remaining == original
         assert not (billed and refunded)
         assert not (hold.status == "committed" and claim is None)
         assert not (receipts_n > 0 and refunded)
+
+
+def test_recover_ambiguous_cannot_overwrite_committed(cx):
+    """Stale executing object must not CAS/ORM-write committed → ambiguous."""
+    from datetime import datetime, timedelta, timezone
+
+    from crossing import billing, ledger, receipts
+    from crossing.mandate import load_live_mandate
+    from crossing.models import IdempotencyRecord, Invocation, Mandate, Receipt, Reservation
+
+    with db.session_scope() as s:
+        p = create_principal(s, "StaleAmb")
+        a = create_agent(s, p.id, "bot")
+        m = issue_mandate(
+            s,
+            principal_id=p.id,
+            agent_id=a.id,
+            spend_limit_cents=100,
+            max_call_cents=100,
+            tools=["search"],
+            servers=["mock"],
+            expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
+        )
+        res, inv = ledger.reserve_and_commit(
+            s, load_live_mandate(s, m.id), 5, idempotency_key="r8-stale", tool="search", server="mock"
+        )
+        rid, iid, mid = res.id, inv.id, m.id
+        pid, aid = p.id, a.id
+        original = m.spend_limit_cents
+
+    s_stale = db.get_session()
+    s_ok = db.get_session()
+    try:
+        marked = ledger.mark_executing(s_ok, s_ok.get(Invocation, iid))
+        assert marked.won
+        stale = s_stale.get(Invocation, iid)
+        assert stale.status == "executing"
+        s_stale.commit()
+
+        hold = s_ok.get(Reservation, rid)
+        invocation = s_ok.get(Invocation, iid)
+
+        def receipt_fn(sess):
+            return receipts.issue(
+                sess,
+                principal_id=pid,
+                mandate_id=mid,
+                reservation_id=rid,
+                tool="search",
+                server="mock",
+                amount_cents=5,
+                result={"ok": True},
+                agent_id=aid,
+                outcome="ok",
+            )
+
+        def billing_fn(sess, rec):
+            return billing.enqueue(sess, receipt_id=rec.id, amount_cents=5, principal_id=pid)
+
+        fin = ledger.finalize_success(
+            s_ok,
+            hold,
+            invocation,
+            receipt_fn=receipt_fn,
+            billing_fn=billing_fn,
+            result_json='{"ok":true}',
+        )
+        assert fin.won
+        assert stale.status == "executing"
+        out = ledger.recover_reserved(s_stale, stale, mode="ambiguous")
+        assert out.status == "committed"
+    finally:
+        s_stale.close()
+        s_ok.close()
+
+    remaining = cx.remaining(mid)
+    with cx.session() as s:
+        inv = s.get(Invocation, iid)
+        hold = s.get(Reservation, rid)
+        claim = s.query(IdempotencyRecord).filter_by(idempotency_key="r8-stale").one()
+        assert inv.status == "committed"
+        assert inv.status != "ambiguous"
+        assert hold.status == "committed"
+        assert s.query(Receipt).count() == 1
+        assert remaining == original - 5
+        assert s.get(Mandate, mid).remaining_cents == original - 5
+        assert claim.status == "completed"
+
+
+def test_recover_ambiguous_vs_mark_executing_one_winner(cx):
+    """reserved→ambiguous vs reserved→executing: exactly one reserved-row winner."""
+    from datetime import datetime, timedelta, timezone
+
+    from crossing import ledger
+    from crossing.mandate import load_live_mandate
+    from crossing.models import Invocation, Reservation
+
+    with db.session_scope() as s:
+        p = create_principal(s, "AmbMarkRace")
+        a = create_agent(s, p.id, "bot")
+        m = issue_mandate(
+            s,
+            principal_id=p.id,
+            agent_id=a.id,
+            spend_limit_cents=100,
+            max_call_cents=100,
+            tools=["search"],
+            servers=["mock"],
+            expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
+        )
+        res, inv = ledger.reserve_and_commit(
+            s, load_live_mandate(s, m.id), 5, idempotency_key="r8-race", tool="search", server="mock"
+        )
+        rid, iid = res.id, inv.id
+
+    barrier = threading.Barrier(2)
+    lock = threading.Lock()
+    outcomes: dict = {}
+
+    def do_recover() -> None:
+        session = db.get_session()
+        try:
+            barrier.wait(timeout=10)
+            invocation = session.get(Invocation, iid)
+            out = ledger.recover_reserved(session, invocation, mode="ambiguous")
+            with lock:
+                outcomes["recover"] = out.status
+        except Exception as exc:  # noqa: BLE001
+            session.rollback()
+            with lock:
+                outcomes["recover"] = exc
+        finally:
+            session.close()
+
+    def do_mark() -> None:
+        session = db.get_session()
+        try:
+            barrier.wait(timeout=10)
+            invocation = session.get(Invocation, iid)
+            marked = ledger.mark_executing(session, invocation)
+            with lock:
+                outcomes["mark_won"] = marked.won
+                outcomes["mark_status"] = marked.invocation.status
+        except Exception as exc:  # noqa: BLE001
+            session.rollback()
+            with lock:
+                outcomes["mark_won"] = exc
+        finally:
+            session.close()
+
+    threads = [threading.Thread(target=do_recover), threading.Thread(target=do_mark)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    with cx.session() as s:
+        inv = s.get(Invocation, iid)
+        hold = s.get(Reservation, rid)
+        assert inv.status != "reserved"
+        assert inv.status in ("executing", "ambiguous")
+        assert inv.status != "committed"
+        mark_won = outcomes["mark_won"] is True
+        if inv.status == "executing":
+            assert mark_won
+        if not mark_won:
+            assert inv.status == "ambiguous"
+            assert outcomes["recover"] == "ambiguous"
+        assert hold.status == "held"
