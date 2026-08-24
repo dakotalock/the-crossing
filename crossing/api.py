@@ -1,17 +1,21 @@
 from __future__ import annotations
 
 import json
+import logging
 import os
+import uuid
 from contextlib import asynccontextmanager
 from datetime import datetime
 from typing import Any
 
 from fastapi import Cookie, Depends, FastAPI, Header, HTTPException, Request
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse, PlainTextResponse, Response
 from pydantic import BaseModel, Field
+from sqlalchemy import text
+from starlette.types import ASGIApp, Receive, Scope, Send
 
-from crossing import auth, crypto, db, ledger
+from crossing import abuse, auth, crypto, db, ledger, logging_json, metrics
 from crossing.auth import AuthContext, SESSION_COOKIE
 from crossing.dashboard import render
 from crossing.identity import create_agent, create_principal, revoke_agent
@@ -20,6 +24,8 @@ from crossing.mandate import issue_mandate, revoke_mandate
 from crossing.models import Account, Agent, ApiKey, Mandate, Principal, Receipt
 from crossing.policy import PolicyDenied, Reason
 from crossing.receipts import to_dict, verify_receipt
+
+log = logging.getLogger("crossing.api")
 
 
 def _cors_origins() -> list[str]:
@@ -37,8 +43,10 @@ def _boot() -> None:
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
+    logging_json.configure_logging()
     _boot()
     yield
+    log.info("shutdown")
 
 
 app = FastAPI(title="The Crossing", version="0.1.0", lifespan=lifespan)
@@ -47,8 +55,52 @@ app.add_middleware(
     allow_origins=_cors_origins(),
     allow_credentials=False,
     allow_methods=["GET", "POST"],
-    allow_headers=["X-API-Key", "Content-Type"],
+    allow_headers=["X-API-Key", "Content-Type", "X-Request-Id"],
 )
+
+
+class BodyLimitMiddleware:
+    """Reject oversized request bodies via Content-Length (beta)."""
+
+    def __init__(self, app: ASGIApp) -> None:
+        self.app = app
+
+    async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
+        if scope["type"] != "http":
+            await self.app(scope, receive, send)
+            return
+        headers = {k.decode().lower(): v.decode() for k, v in scope.get("headers") or []}
+        cl = headers.get("content-length")
+        limit = abuse.max_body_bytes()
+        if cl:
+            try:
+                n = int(cl)
+            except ValueError:
+                n = 0
+            if n > limit:
+                resp = Response(
+                    content=json.dumps({"detail": {"reason": Reason.PAYLOAD_TOO_LARGE}}),
+                    status_code=413,
+                    media_type="application/json",
+                )
+                await resp(scope, receive, send)
+                return
+        await self.app(scope, receive, send)
+
+
+@app.middleware("http")
+async def request_context(request: Request, call_next):
+    rid = request.headers.get("x-request-id") or str(uuid.uuid4())
+    token = logging_json.request_id_var.set(rid)
+    try:
+        response = await call_next(request)
+    finally:
+        logging_json.request_id_var.reset(token)
+    response.headers["X-Request-Id"] = rid
+    return response
+
+
+app.add_middleware(BodyLimitMiddleware)
 
 
 def _unauth(detail: str = "unauthenticated") -> HTTPException:
@@ -181,6 +233,30 @@ def health() -> dict[str, str]:
     return {"status": "ok"}
 
 
+@app.get("/healthz")
+def healthz() -> dict[str, str]:
+    return {"status": "ok"}
+
+
+@app.get("/readyz")
+def readyz() -> dict[str, Any]:
+    _boot()
+    try:
+        with db.session_scope() as s:
+            s.execute(text("SELECT 1"))
+    except Exception:
+        raise HTTPException(status_code=503, detail="not ready")
+    return {"status": "ready"}
+
+
+@app.get("/metrics")
+def get_metrics(request: Request) -> Response:
+    accept = (request.headers.get("accept") or "") + " " + (request.query_params.get("format") or "")
+    if "json" in accept.lower():
+        return JSONResponse(metrics.snapshot())
+    return PlainTextResponse(metrics.prometheus_text(), media_type="text/plain; version=0.0.4")
+
+
 @app.get("/", response_class=HTMLResponse)
 def dashboard(
     x_api_key: str | None = Header(default=None, alias="X-API-Key"),
@@ -195,6 +271,23 @@ def dashboard(
         raise _forbidden("missing scope read")
     with db.session_scope() as s:
         return render(s, account_id=None if ctx.is_admin else ctx.account_id, is_admin=ctx.is_admin)
+
+
+@app.get("/v1/account")
+def get_account(ctx: AuthContext = Depends(require_scope("read"))) -> dict[str, Any]:
+    with db.session_scope() as s:
+        acct = s.get(Account, ctx.account_id)
+        if acct is None:
+            raise _closed()
+        return {
+            "account_id": acct.id,
+            "name": acct.name,
+            "api_key_id": ctx.api_key_id,
+            "prefix": ctx.prefix,
+            "kind": ctx.kind,
+            "scopes": ctx.scopes,
+            "stripe_customer_present": bool(acct.stripe_customer_id),
+        }
 
 
 @app.post("/v1/principals")
@@ -299,6 +392,11 @@ def post_mandate_revoke(mandate_id: str, ctx: AuthContext = Depends(require_scop
 @app.post("/v1/invoke")
 def post_invoke(body: InvokeIn, ctx: AuthContext = Depends(require_scope("invoke"))) -> dict[str, Any]:
     denied = None
+    try:
+        abuse.check_rate_limit(ctx.api_key_id)
+    except PolicyDenied as exc:
+        metrics.inc_deny(exc.reason)
+        raise HTTPException(status_code=429, detail={"reason": exc.reason, "detail": exc.detail}) from exc
     try:
         with db.session_scope() as s:
             _own_mandate(s, ctx, body.mandate_id)
