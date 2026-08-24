@@ -102,12 +102,11 @@ def health() -> dict[str, str]:
 
 
 @app.get("/", response_class=HTMLResponse)
-def dashboard(key: str | None = None, x_api_key: str | None = Header(default=None, alias="X-API-Key")) -> str:
+def dashboard(x_api_key: str | None = Header(default=None, alias="X-API-Key")) -> str:
     _boot()
-    token = x_api_key or key
-    if not token:
+    if not x_api_key:
         raise HTTPException(status_code=401, detail={"reason": Reason.UNAUTHORIZED, "detail": "unauthenticated"})
-    require_api_key(token)
+    require_api_key(x_api_key)
     with db.session_scope() as s:
         return render(s)
 
