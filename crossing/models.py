@@ -7,6 +7,7 @@ from typing import Any
 
 from sqlalchemy import (
     Boolean,
+    CheckConstraint,
     DateTime,
     ForeignKey,
     Integer,
@@ -34,6 +35,7 @@ class Principal(Base):
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     name: Mapped[str] = mapped_column(String(200))
+    pubkey_hex: Mapped[str | None] = mapped_column(String(80), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
     agents: Mapped[list[Agent]] = relationship(back_populates="principal")
@@ -67,7 +69,16 @@ class Task(Base):
 
 class Mandate(Base):
     __tablename__ = "mandates"
-    __table_args__ = (UniqueConstraint("nonce", name="uq_mandate_nonce"),)
+    __table_args__ = (
+        UniqueConstraint("nonce", name="uq_mandate_nonce"),
+        CheckConstraint("spend_limit_cents >= 0", name="ck_mandate_spend_nonneg"),
+        CheckConstraint("remaining_cents >= 0", name="ck_mandate_remaining_nonneg"),
+        CheckConstraint("max_call_cents >= 0", name="ck_mandate_max_call_nonneg"),
+        CheckConstraint(
+            "max_subagent_budget_cents IS NULL OR max_subagent_budget_cents >= 0",
+            name="ck_mandate_subagent_nonneg",
+        ),
+    )
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     principal_id: Mapped[str] = mapped_column(ForeignKey("principals.id"), index=True)
@@ -112,7 +123,8 @@ class LedgerEvent(Base):
     principal_id: Mapped[str] = mapped_column(String(36), index=True)
     mandate_id: Mapped[str] = mapped_column(String(36), index=True)
     reservation_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
-    kind: Mapped[str] = mapped_column(String(40), index=True)
+    task_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    kind: Mapped[str] = mapped_column(String(40), index=True)  # reserve|commit|release|deny|escrow|unescrow
     amount_cents: Mapped[int] = mapped_column(Integer, default=0)
     remaining_after: Mapped[int | None] = mapped_column(Integer, nullable=True)
     idempotency_key: Mapped[str | None] = mapped_column(String(120), nullable=True)
@@ -122,12 +134,13 @@ class LedgerEvent(Base):
 
 class Reservation(Base):
     __tablename__ = "reservations"
+    __table_args__ = (CheckConstraint("amount_cents >= 0", name="ck_reservation_amount_nonneg"),)
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     principal_id: Mapped[str] = mapped_column(String(36), index=True)
     mandate_id: Mapped[str] = mapped_column(ForeignKey("mandates.id"), index=True)
     amount_cents: Mapped[int] = mapped_column(Integer)
-    status: Mapped[str] = mapped_column(String(20), default="held")
+    status: Mapped[str] = mapped_column(String(20), default="held")  # held|committed|released
     idempotency_key: Mapped[str | None] = mapped_column(String(120), nullable=True)
     nonce: Mapped[str | None] = mapped_column(String(80), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
@@ -139,6 +152,8 @@ class Receipt(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     principal_id: Mapped[str] = mapped_column(String(36), index=True)
     mandate_id: Mapped[str] = mapped_column(String(36), index=True)
+    agent_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    task_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
     reservation_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
     tool: Mapped[str] = mapped_column(String(80))
     server: Mapped[str] = mapped_column(String(80))
@@ -153,12 +168,14 @@ class Receipt(Base):
 
 
 class Outbox(Base):
-    __tablename__ = "outbox"
+    """billing_outbox: pending Stripe (or noop) work. Never HTTP inside the ledger txn."""
+
+    __tablename__ = "billing_outbox"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     kind: Mapped[str] = mapped_column(String(40), default="stripe_meter")
     payload_json: Mapped[str] = mapped_column(Text)
-    status: Mapped[str] = mapped_column(String(20), default="pending")
+    status: Mapped[str] = mapped_column(String(20), default="pending")  # pending|sent|failed|noop
     attempts: Mapped[int] = mapped_column(Integer, default=0)
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
@@ -173,6 +190,7 @@ class IdempotencyRecord(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     principal_id: Mapped[str] = mapped_column(String(36), index=True)
     idempotency_key: Mapped[str] = mapped_column(String(120))
+    request_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
     result_json: Mapped[str] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
@@ -184,4 +202,24 @@ class UsedNonce(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     principal_id: Mapped[str] = mapped_column(String(36), index=True)
     nonce: Mapped[str] = mapped_column(String(80))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class Invocation(Base):
+    """Durable operations row. reserve_and_commit writes status=reserved before execute."""
+
+    __tablename__ = "invocations"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    principal_id: Mapped[str] = mapped_column(String(36), index=True)
+    mandate_id: Mapped[str] = mapped_column(String(36), index=True)
+    reservation_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    task_id: Mapped[str | None] = mapped_column(String(36), nullable=True)
+    tool: Mapped[str] = mapped_column(String(80), default="")
+    server: Mapped[str] = mapped_column(String(80), default="")
+    request_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
+    idempotency_key: Mapped[str | None] = mapped_column(String(120), nullable=True)
+    amount_cents: Mapped[int] = mapped_column(Integer, default=0)
+    # reserved | executed_ok | executed_fail | committed | released | ambiguous
+    status: Mapped[str] = mapped_column(String(20), default="reserved")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
