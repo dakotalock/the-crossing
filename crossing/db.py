@@ -6,7 +6,7 @@ import os
 from collections.abc import Iterator
 from contextlib import contextmanager
 
-from sqlalchemy import create_engine, event
+from sqlalchemy import create_engine, event, inspect
 from sqlalchemy.engine import Engine
 from sqlalchemy.orm import Session, sessionmaker
 from sqlalchemy.pool import StaticPool
@@ -60,11 +60,55 @@ def make_engine(url: str | None = None) -> Engine:
     return engine
 
 
+REQUIRED_TABLES = (
+    "accounts",
+    "principals",
+    "agents",
+    "mandates",
+    "ledger_events",
+    "reservations",
+    "receipts",
+    "billing_outbox",
+    "idempotency_records",
+    "used_nonces",
+    "invocations",
+    "api_keys",
+    "reconciliation_events",
+)
+
+
+def schema_ready(engine: Engine) -> bool:
+    insp = inspect(engine)
+    names = set(insp.get_table_names())
+    return all(t in names for t in REQUIRED_TABLES)
+
+
 def init_db(url: str | None = None) -> Engine:
+    """Dev sqlite may create_all. Production requires Alembic-applied schema."""
     global _engine, SessionLocal
+    from crossing.crypto import ProductionConfigError, allow_dev
+
     _engine = make_engine(url)
-    Base.metadata.create_all(_engine)
+    if allow_dev():
+        Base.metadata.create_all(_engine)
+    elif not schema_ready(_engine):
+        raise ProductionConfigError(
+            "database schema missing; run `alembic upgrade head` "
+            "(create_all is disabled when CROSSING_ALLOW_DEV!=1)"
+        )
     SessionLocal = sessionmaker(bind=_engine, expire_on_commit=False, autoflush=True, future=True)
+    if allow_dev():
+        from crossing.auth import ensure_bootstrap
+
+        session = SessionLocal()
+        try:
+            ensure_bootstrap(session)
+            session.commit()
+        except Exception:
+            session.rollback()
+            raise
+        finally:
+            session.close()
     return _engine
 
 
