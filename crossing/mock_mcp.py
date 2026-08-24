@@ -22,8 +22,8 @@ TOOLS = {
     },
 }
 
-# Tests may replace these callables.
-HOOKS: dict[str, Callable[[dict[str, Any]], Any]] = {}
+# Tests may replace these callables. Signature: (arguments, **ids) -> result
+HOOKS: dict[str, Callable[..., Any]] = {}
 
 
 class MCPError(RuntimeError):
@@ -34,10 +34,21 @@ def list_tools() -> list[dict[str, Any]]:
     return list(TOOLS.values())
 
 
-def call_tool(name: str, arguments: dict[str, Any] | None = None) -> Any:
+def call_tool(
+    name: str,
+    arguments: dict[str, Any] | None = None,
+    *,
+    invocation_id: str | None = None,
+    idempotency_key: str | None = None,
+) -> Any:
     arguments = arguments or {}
+    extra = {"invocation_id": invocation_id, "idempotency_key": idempotency_key}
     if name in HOOKS:
-        return HOOKS[name](arguments)
+        hook = HOOKS[name]
+        try:
+            return hook(arguments, **extra)
+        except TypeError:
+            return hook(arguments)
     if name == "search":
         q = arguments.get("q") or arguments.get("query") or ""
         return {"hits": [{"title": f"result for {q}", "url": "https://example.invalid"}], "q": q}
