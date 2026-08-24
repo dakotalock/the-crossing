@@ -31,14 +31,29 @@ class Base(DeclarativeBase):
     pass
 
 
+class Account(Base):
+    """Tenant. v1 is 1:1 with Principal; API keys hang off Account."""
+
+    __tablename__ = "accounts"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    name: Mapped[str] = mapped_column(String(200))
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+    principals: Mapped[list[Principal]] = relationship(back_populates="account")
+    api_keys: Mapped[list[ApiKey]] = relationship(back_populates="account")
+
+
 class Principal(Base):
     __tablename__ = "principals"
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    account_id: Mapped[str] = mapped_column(ForeignKey("accounts.id"), index=True)
     name: Mapped[str] = mapped_column(String(200))
     pubkey_hex: Mapped[str | None] = mapped_column(String(80), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
+    account: Mapped[Account] = relationship(back_populates="principals")
     agents: Mapped[list[Agent]] = relationship(back_populates="principal")
     mandates: Mapped[list[Mandate]] = relationship(back_populates="principal")
 
@@ -229,5 +244,39 @@ class Invocation(Base):
     idempotency_key: Mapped[str | None] = mapped_column(String(120), nullable=True)
     amount_cents: Mapped[int] = mapped_column(Integer, default=0)
     # reserved | executing | executed_ok | executed_fail | committed | released | ambiguous
-    status: Mapped[str] = mapped_column(String(20), default="reserved")
+    # | reconciled_committed | reconciled_released
+    status: Mapped[str] = mapped_column(String(32), default="reserved")
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+
+
+class ApiKey(Base):
+    __tablename__ = "api_keys"
+    __table_args__ = (UniqueConstraint("prefix", name="uq_api_key_prefix"),)
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    account_id: Mapped[str] = mapped_column(ForeignKey("accounts.id"), index=True)
+    prefix: Mapped[str] = mapped_column(String(40), index=True)
+    secret_hash: Mapped[str] = mapped_column(String(64))
+    scopes_json: Mapped[str] = mapped_column(Text, default="[]")
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    kind: Mapped[str] = mapped_column(String(20), default="customer")  # customer|admin
+
+    account: Mapped[Account] = relationship(back_populates="api_keys")
+
+
+class ReconciliationEvent(Base):
+    """Append-only reconciliation evidence. Never delete historical attempts."""
+
+    __tablename__ = "reconciliation_events"
+
+    id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
+    invocation_id: Mapped[str] = mapped_column(String(36), index=True)
+    from_status: Mapped[str] = mapped_column(String(32))
+    to_status: Mapped[str] = mapped_column(String(32))
+    actor: Mapped[str] = mapped_column(String(80))
+    evidence_ref: Mapped[str] = mapped_column(String(200))
+    evidence_kind: Mapped[str] = mapped_column(String(40))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
