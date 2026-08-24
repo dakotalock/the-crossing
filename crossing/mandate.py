@@ -5,7 +5,7 @@ import secrets
 from datetime import datetime
 from typing import Any
 
-from sqlalchemy import select, update
+from sqlalchemy import or_, select, update
 from sqlalchemy.orm import Session
 
 from crossing import crypto
@@ -210,14 +210,21 @@ def issue_mandate(
     session.flush()
 
     if parent is not None:
+        from crossing.models import utcnow as _utcnow
+
+        now = _utcnow()
+        bind = session.get_bind()
+        now_sql = now.replace(tzinfo=None) if bind is not None and bind.dialect.name == "sqlite" else now
         escrowed = session.execute(
             update(Mandate)
             .where(
                 Mandate.id == parent.id,
                 Mandate.remaining_cents >= spend_limit_cents,
                 Mandate.revoked.is_(False),
+                or_(Mandate.expires_at.is_(None), Mandate.expires_at > now_sql),
             )
             .values(remaining_cents=Mandate.remaining_cents - spend_limit_cents)
+            .execution_options(synchronize_session=False)
             .returning(Mandate.remaining_cents)
         ).first()
         if escrowed is None:
