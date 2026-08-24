@@ -7,6 +7,7 @@ from crossing.api import app
 
 def test_health_and_story(cx):
     client = TestClient(app)
+    client.headers["X-API-Key"] = "dev"
     assert client.get("/health").json()["status"] == "ok"
     p = client.post("/v1/principals", json={"name": "Bob"}).json()
     a = client.post("/v1/agents", json={"principal_id": p["id"], "name": "bot"}).json()
@@ -40,7 +41,6 @@ def test_dashboard_requires_auth(cx):
     client = TestClient(app)
     denied = client.get("/")
     assert denied.status_code == 401
-    # query-string auth was removed — must not succeed even with the real key
     qs = client.get("/?key=dev")
     assert qs.status_code == 401
     bad = client.get("/?key=wrong")
@@ -48,3 +48,6 @@ def test_dashboard_requires_auth(cx):
     ok_header = client.get("/", headers={"X-API-Key": "dev"})
     assert ok_header.status_code == 200
     assert "principals" in ok_header.text
+    client.cookies.set("crossing_session", "dev")
+    cookie = client.get("/")
+    assert cookie.status_code == 200
