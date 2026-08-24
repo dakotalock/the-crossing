@@ -382,3 +382,127 @@ def test_commit_and_release_cas_one_winner(cx):
             assert remaining == original
             assert row.calls_used == 0
             assert terminals[0].kind == "release"
+
+
+def test_finalize_success_vs_recover_release_one_universe(cx):
+    """Success finalize and recover-release race: exactly one terminal universe."""
+    from datetime import datetime, timedelta, timezone
+
+    from crossing import billing, ledger, receipts
+    from crossing.mandate import load_live_mandate
+    from crossing.models import IdempotencyRecord, Invocation, Mandate, Outbox, Receipt, Reservation
+
+    with db.session_scope() as s:
+        p = create_principal(s, "FinalizeRacer")
+        a = create_agent(s, p.id, "bot")
+        m = issue_mandate(
+            s,
+            principal_id=p.id,
+            agent_id=a.id,
+            spend_limit_cents=100,
+            max_call_cents=100,
+            tools=["search"],
+            servers=["mock"],
+            expires_at=datetime.now(timezone.utc) + timedelta(hours=1),
+        )
+        res, inv = ledger.reserve_and_commit(
+            s, load_live_mandate(s, m.id), 5, idempotency_key="fin-race", tool="search", server="mock"
+        )
+        rid, iid, mid, original = res.id, inv.id, m.id, m.spend_limit_cents
+        pid = p.id
+        aid = a.id
+
+    lock = threading.Lock()
+    outcomes: list = []
+
+    def do_success() -> None:
+        session = db.get_session()
+        try:
+            hold = session.get(Reservation, rid)
+            invocation = session.get(Invocation, iid)
+
+            def receipt_fn(s):
+                return receipts.issue(
+                    s,
+                    principal_id=pid,
+                    mandate_id=mid,
+                    reservation_id=rid,
+                    tool="search",
+                    server="mock",
+                    amount_cents=5,
+                    result={"ok": True},
+                    agent_id=aid,
+                    outcome="ok",
+                )
+
+            def billing_fn(s, rec):
+                return billing.enqueue(s, receipt_id=rec.id, amount_cents=5, principal_id=pid)
+
+            fin = ledger.finalize_success(
+                session,
+                hold,
+                invocation,
+                receipt_fn=receipt_fn,
+                billing_fn=billing_fn,
+                result_json='{"ok":true}',
+            )
+            with lock:
+                outcomes.append(("success", fin.won))
+        except Exception as exc:  # noqa: BLE001
+            session.rollback()
+            with lock:
+                outcomes.append(("success", exc))
+        finally:
+            session.close()
+
+    def do_release() -> None:
+        session = db.get_session()
+        try:
+            invocation = session.get(Invocation, iid)
+            out = ledger.recover_reserved(session, invocation, mode="release")
+            with lock:
+                outcomes.append(("release", out.status))
+        except Exception as exc:  # noqa: BLE001
+            session.rollback()
+            with lock:
+                outcomes.append(("release", exc))
+        finally:
+            session.close()
+
+    threads = [threading.Thread(target=do_success), threading.Thread(target=do_release)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+
+    remaining = cx.remaining(mid)
+    with cx.session() as s:
+        hold = s.get(Reservation, rid)
+        invocation = s.get(Invocation, iid)
+        claim = s.query(IdempotencyRecord).filter_by(idempotency_key="fin-race").one_or_none()
+        receipts_n = s.query(Receipt).count()
+        outbox_n = s.query(Outbox).count()
+        mandate = s.get(Mandate, mid)
+        assert hold.status in ("committed", "released")
+        if hold.status == "committed":
+            assert invocation.status == "committed"
+            assert claim is not None and claim.status == "completed"
+            assert receipts_n == 1
+            assert outbox_n == 1
+            assert remaining == original - 5
+            assert mandate.remaining_cents == original - 5
+            assert mandate.calls_used == 1
+        else:
+            assert invocation.status == "released"
+            assert claim is None
+            assert receipts_n == 0
+            assert outbox_n == 0
+            assert remaining == original
+            assert mandate.remaining_cents == original
+            assert mandate.calls_used == 0
+        # Never both billed and refunded; never committed hold + cleared claim.
+        billed = outbox_n > 0
+        refunded = remaining == original
+        assert not (billed and refunded)
+        assert not (hold.status == "committed" and claim is None)
+        assert not (receipts_n > 0 and refunded)
