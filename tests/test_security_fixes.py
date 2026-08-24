@@ -6,7 +6,7 @@ from fastapi.testclient import TestClient
 from crossing import billing, crypto, db, ledger
 from crossing.api import app
 from crossing.mandate import load_live_mandate
-from crossing.models import IdempotencyRecord, Invocation, LedgerEvent, Mandate, Outbox, Reservation
+from crossing.models import Account, IdempotencyRecord, Invocation, LedgerEvent, Mandate, Outbox, Principal, Reservation
 from crossing.policy import PolicyDenied, Reason
 
 
@@ -38,9 +38,10 @@ def test_reserve_and_commit_then_crash_keeps_decrement(seeded):
 
 
 def test_stripe_not_called_until_after_commit(seeded, monkeypatch):
-    cx, _, _, m = seeded
+    cx, p, _, m = seeded
     monkeypatch.setenv("STRIPE_SECRET_KEY", "sk_test_not_real")
-    monkeypatch.setenv("STRIPE_CUSTOMER_ID", "cus_x")
+    with cx.session() as s:
+        s.get(Account, s.get(Principal, p.id).account_id).stripe_customer_id = "cus_x"
     order: list[str] = []
     from sqlalchemy.orm import Session as SASession
 
@@ -58,8 +59,10 @@ def test_stripe_not_called_until_after_commit(seeded, monkeypatch):
     monkeypatch.setattr(billing, "post_stripe", spy)
     r = cx.invoke(m.id, "search", {"q": "order"}, idempotency_key="order-1")
     assert r.ok
-    assert "stripe" in order
+    assert "stripe" not in order
     assert "commit" in order
+    billing.drain_outbox()
+    assert "stripe" in order
     assert order.index("stripe") > order.index("commit")
     with cx.session() as s:
         assert any(e.kind == "commit" for e in s.query(LedgerEvent).all())
@@ -67,9 +70,10 @@ def test_stripe_not_called_until_after_commit(seeded, monkeypatch):
 
 
 def test_drain_http_failure_leaves_ledger(seeded, monkeypatch):
-    cx, _, _, m = seeded
+    cx, p, _, m = seeded
     monkeypatch.setenv("STRIPE_SECRET_KEY", "sk_test_not_real")
-    monkeypatch.setenv("STRIPE_CUSTOMER_ID", "cus_x")
+    with cx.session() as s:
+        s.get(Account, s.get(Principal, p.id).account_id).stripe_customer_id = "cus_x"
 
     def boom(_payload):
         raise RuntimeError("http failed")
@@ -77,6 +81,7 @@ def test_drain_http_failure_leaves_ledger(seeded, monkeypatch):
     monkeypatch.setattr(billing, "post_stripe", boom)
     r = cx.invoke(m.id, "search", {"q": "drain-fail"}, idempotency_key="drain-fail")
     assert r.ok is True
+    billing.drain_outbox()
     assert cx.remaining(m.id) == 95
     with cx.session() as s:
         assert any(h.status == "committed" for h in s.query(Reservation).all())
@@ -462,4 +467,3 @@ def test_finalize_success_refuses_reserved_without_executing(seeded):
         claim = s.query(IdempotencyRecord).filter_by(idempotency_key="r8-no-exec").one()
         assert claim.status == "in_progress"
     assert cx.remaining(m.id) == 95
-
