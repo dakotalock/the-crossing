@@ -35,15 +35,15 @@ flowchart LR
   MCP -->|error| Release[release reservation]
 ```
 
-Lifecycle: **quote → authorize → reserve_and_commit → execute → commit | release**.
+Lifecycle: **quote → authorize → reserve_and_commit → execute → finalize_success | finalize_release**.
 
-`reserve_and_commit()` treats **claim + reserve + invocation insert** as one savepoint. If the atomic debit fails (`BUDGET_EXCEEDED`), the LogicalOperation claim rolls back with it — the key is not left `in_progress` with no attempt. On success it **COMMITs before** the tool runs. A later transaction records success (ledger, receipt, billing_outbox pending) or release. Crash-after-execute-before-commit leaves a recoverable `reserved` ExecutionAttempt; it does not silently roll back the reserve.
+`reserve_and_commit()` treats **claim + reserve + invocation insert** as one savepoint. If the atomic debit fails (`BUDGET_EXCEEDED`), the LogicalOperation claim rolls back with it — the key is not left `in_progress` with no attempt. On success it **COMMITs before** the tool runs. A later transaction records success or release via `finalize_success` / `finalize_release`. Those functions own the **entire** terminal unit (reservation CAS, invocation status, receipt, billing outbox, LogicalOperation claim, ledger event) in one savepoint. Losing the reservation or invocation CAS rolls the savepoint back — no receipt-then-lost-commit, no refund-then-cleared-claim. Crash-after-execute-before-finalize leaves a recoverable `reserved` ExecutionAttempt; it does not silently roll back the reserve.
 
 **LogicalOperation vs ExecutionAttempt:** `IdempotencyRecord` is the logical operation (unique `(principal_id, idempotency_key)`). `Invocation` is an execution attempt; the unique index on `(principal_id, idempotency_key)` was dropped so a released attempt can be retried under the same key. Completed claims still replay. An `in_progress` claim still returns `IN_PROGRESS` (wait-or-conflict) unless it was rolled back or explicitly released for retry.
 
 Scarce-authority transitions are conditional `UPDATE … RETURNING` on SQLite and Postgres: mandate debit (`remaining_cents >= cost AND revoked = 0 AND (max_calls IS NULL OR calls_used < max_calls)`), child-mandate escrow from parent remaining, and reservation `held → committed|released` CAS. CI runs a `sqlite` job and a `postgres` job. Multi-host isolation is still **not** fully solved (one primary, row-level updates — not consensus across replicas).
 
-Recovery (`ledger.recover_reserved`): default `mode="ambiguous"` marks the attempt `ambiguous`, does **not** refund, and does **not** clear the LogicalOperation claim (retry stays blocked). Explicit `mode="release"` refunds remaining, marks the attempt released, and deletes the matching `IdempotencyRecord` so the same key can start a new attempt. Only use release when execute can be proven never to have started. The MCP execute-fail path already deletes an `in_progress` claim after release.
+Recovery (`ledger.recover_reserved`): default `mode="ambiguous"` marks the attempt `ambiguous`, does **not** refund, and does **not** clear the LogicalOperation claim (retry stays blocked). Explicit `mode="release"` calls `finalize_release` (invocation must still be `reserved`): reservation `held→released` and invocation `reserved→released` must both win or the savepoint rolls back (no refund, claim kept). The MCP fail path uses the same `finalize_release` with allowed statuses `reserved` / `executed_fail`.
 
 Child mandates are *attenuated*: child spend must be `> 0` and `<= parent remaining` and `<= parent spend_limit`; max_call, tools/servers subset, expiry not later than parent, `max_subagent_budget <= remaining`. Issuing a child **escrows** the child's spend cap from the parent remaining budget. Negative child spend is rejected and cannot mint parent budget.
 
@@ -125,13 +125,17 @@ Install `psycopg[binary]` (listed in `requirements.txt`) and set `DATABASE_URL=p
 
 The mandate debit, child escrow, and reservation terminal transitions are conditional updates (SQLite and Postgres). Local default is still SQLite. CI has a `postgres` job (`DATABASE_URL=postgresql+psycopg://…`). That is not multi-host consensus.
 
-## Review r5 (honest)
+## Review r6 (honest)
 
-- Scarce-authority transitions are conditional `UPDATE`s (debit + `max_calls`, child escrow, reservation CAS). Failed debit distinguishes `BUDGET_EXCEEDED` vs `MAX_CALLS_EXCEEDED`; PolicyDenied and the deny ledger note match.
-- CI has a `sqlite` job and a `postgres` job. Local pytest still defaults to a temp SQLite file unless `DATABASE_URL` is postgres.
+- `finalize_success` / `finalize_release` own the whole ending: reservation CAS, invocation, receipt, outbox, claim, and ledger event share one savepoint. A lost CAS does nothing else. `commit()` / `release()` remain low-level reservation helpers.
 - Still one global `CROSSING_API_KEY` (prototype-only).
 - Still at-most-one Crossing dispatch, not provider exactly-once.
 - Still not real-money-ready.
+
+## Review r5 (kept)
+
+- Scarce-authority transitions are conditional `UPDATE`s (debit + `max_calls`, child escrow, reservation CAS). Failed debit distinguishes `BUDGET_EXCEEDED` vs `MAX_CALLS_EXCEEDED`; PolicyDenied and the deny ledger note match.
+- CI has a `sqlite` job and a `postgres` job. Local pytest still defaults to a temp SQLite file unless `DATABASE_URL` is postgres.
 
 ## Review r4 (kept)
 
