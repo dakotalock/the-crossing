@@ -228,6 +228,6 @@ class Invocation(Base):
     request_hash: Mapped[str | None] = mapped_column(String(64), nullable=True)
     idempotency_key: Mapped[str | None] = mapped_column(String(120), nullable=True)
     amount_cents: Mapped[int] = mapped_column(Integer, default=0)
-    # in_progress | reserved | executed_ok | executed_fail | committed | released | ambiguous
+    # reserved | executing | executed_ok | executed_fail | committed | released | ambiguous
     status: Mapped[str] = mapped_column(String(20), default="reserved")
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
