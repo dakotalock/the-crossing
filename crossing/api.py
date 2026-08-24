@@ -660,6 +660,7 @@ def post_admin_stripe_customer(
             raise _forbidden()
         try:
             acct = billing.attach_stripe_customer(s, account_id, body.stripe_customer_id)
+        except PolicyDenied as exc:
             raise HTTPException(status_code=409, detail={"reason": exc.reason, "detail": exc.detail}) from exc
         return {
             "account_id": acct.id,
