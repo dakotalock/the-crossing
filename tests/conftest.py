@@ -20,7 +20,7 @@ def _test_database_url(tmp_path) -> str:
     env = os.environ.get("DATABASE_URL") or os.environ.get("CROSSING_DATABASE_URL") or ""
     if env.startswith("postgresql"):
         return env
-    url = f"sqlite:///{tmp_path / 'crossing.db'}"
+    url = f"sqlite:///{tmp_path / "crossing.db"}"
     os.environ["DATABASE_URL"] = url
     return url
 
@@ -31,10 +31,13 @@ def cx(tmp_path):
     db.reset_engine()
     url = _test_database_url(tmp_path)
     if url.startswith("postgresql"):
-        from crossing.models import Base
-
         engine = db.make_engine(url)
-        Base.metadata.drop_all(engine)
+        if db.schema_ready(engine):
+            db.truncate_all(engine)
+        else:
+            from crossing.models import Base
+
+            Base.metadata.drop_all(engine)
         engine.dispose()
     return Crossing(database_url=url)
 
