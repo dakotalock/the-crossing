@@ -249,6 +249,12 @@ def healthz() -> dict[str, str]:
     return {"status": "ok"}
 
 
+@app.get("/.well-known/crossing-keys")
+def well_known_crossing_keys() -> dict[str, Any]:
+    _boot()
+    return crypto.published_keys()
+
+
 @app.get("/readyz")
 def readyz() -> dict[str, Any]:
     _boot()
