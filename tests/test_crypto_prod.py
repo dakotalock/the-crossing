@@ -15,4 +15,4 @@ def test_prod_refuses_missing_seed(monkeypatch):
         crypto.signing_key()
     monkeypatch.setenv("CROSSING_ALLOW_DEV", "1")
     crypto.reset_for_tests()
-    crypto.signing_key()
+    crypto.signing_key()  # ephemeral ok
