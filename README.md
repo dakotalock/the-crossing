@@ -96,6 +96,9 @@ Out of scope for this MVP:
 - `POST /v1/keys` `POST /v1/keys/{id}/rotate` `POST /v1/keys/{id}/revoke` (raw secret returned once)
 - `POST /v1/mandates/{id}/revoke`
 - `POST /v1/invocations/{id}/reconcile` (`outcome=committed|released`, `evidence_ref` required)
+- `POST /v1/stripe/webhooks` (Stripe-Signature; replay of the same `event_id` is 200 no-op)
+- `POST /v1/admin/accounts/{id}/stripe-customer` (admin; attach `stripe_customer_id`)
+- `GET /v1/billing/status` (scope `billing:read`; plan id, customer present?, usage; never Stripe secrets)
 
 ## Receipts
 
@@ -123,7 +126,11 @@ Crossing forwards a stable `invocation_id` and the `idempotency_key` into `mock_
 | `search` | $0.05 |
 | `purchase` / `expensive` | $5.00 |
 
-Stripe: if `STRIPE_SECRET_KEY` is unset the adapter no-ops **and still writes a billing_outbox row** (`status=noop` after drain). HTTP to Stripe happens only in `drain_outbox()`, after the ledger/receipt commit. Failures mark `failed` (with `attempts`, `next_attempt_at`, `last_error`) and never undo `commit`. Drain claims rows by setting `status=sending` where status is pending/failed so two workers cannot double-send. Retryable rows are `pending` or (`failed` and `next_attempt_at <= now` and `attempts < 8`). Backoff is 1, 2, 4, 8… minutes (cap 60). After 8 attempts the row is `dead`.
+Stripe is **control-plane billing, not custody**. Map `accounts.stripe_customer_id` (nullable). Env: `STRIPE_SECRET_KEY`, `STRIPE_WEBHOOK_SECRET`, `STRIPE_PRICE_ID` (subscription), optional `STRIPE_METER_EVENT`. If `STRIPE_SECRET_KEY` is unset the adapter no-ops **and still writes a billing_outbox row** (`status=noop` after drain). HTTP to Stripe happens only in `drain_outbox()` / `python -m crossing.worker`, after the ledger/receipt commit. Failures mark `failed` (with `attempts`, `next_attempt_at`, `last_error`) and never undo `commit`. One outbox row per `receipt_id` (unique). Drain CAS-claims `pending`/`failed` (due `next_attempt_at`) **or stale `sending`** (lease/heartbeat, default 30s) → `sending` so two workers cannot double-send. Backoff is 1, 2, 4, 8… minutes (cap 60). After 8 attempts the row is `dead`. `python -m crossing.worker --once` drains one batch.
+
+Platform fee: integer `CROSSING_FEE_BPS` (default 0). Fees accumulate as integer **microcents** (`amount_cents * bps * 100`); a 4bps event that is below 1 cent is **not** rounded to zero. Whole cents are invoiced only when the remainder reaches `>= 1` cent. Commercial Stripe price ids are not written to the ledger.
+
+Webhook: verify `stripe-signature`, persist `stripe_events.event_id` as PK. Replay is 200 + `duplicate: true` and does not mutate Crossing remaining/commit state.
 
 ## Postgres
 
@@ -133,10 +140,12 @@ The mandate debit, child escrow, and reservation terminal transitions are condit
 
 ## Alembic
 
-`alembic.ini` + `alembic/versions/` ship an initial migration matching current models (including `accounts`, `api_keys`, `reconciliation_events`).
+`alembic.ini` + `alembic/versions/` ship migrations matching current models (including `accounts`, `api_keys`, `reconciliation_events`, `stripe_events`).
 
-- Dev (`CROSSING_ALLOW_DEV=1`): sqlite may `create_all` **or** `alembic upgrade head`.
+- Dev (`CROSSING_ALLOW_DEV=1`): sqlite may `create_all` **or** `alembic upgrade head`. `create_all` runs only when required tables are missing (so an Alembic-applied postgres DB is not rewritten).
 - Production (`CROSSING_ALLOW_DEV!=1`): **do not** `create_all`. Apply migrations before boot (`alembic upgrade head`). API/worker refuse to start if required tables are missing.
+
+CI: `sqlite` job (`CROSSING_ALLOW_DEV=1`, `CROSSING_KEY_PEPPER` set) and `postgres` job (empty DB → `alembic upgrade head` → pytest, no `create_all`).
 
 `alembic/env.py` reads `DATABASE_URL` the same way as `crossing/db.py`.
 
