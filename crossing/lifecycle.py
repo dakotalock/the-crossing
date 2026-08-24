@@ -250,7 +250,12 @@ def invoke(
 
     # External execute is outside the reserve transaction (already committed).
     try:
-        tool_result = mock_mcp.call_tool(tool, arguments or {})
+        tool_result = mock_mcp.call_tool(
+            tool,
+            arguments or {},
+            invocation_id=invocation.id,
+            idempotency_key=idempotency_key,
+        )
         invocation.status = "executed_ok"
         session.flush()
     except Exception as exc:  # MCP failure releases the hold
