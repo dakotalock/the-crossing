@@ -1,0 +1,65 @@
+services:
+  - type: web
+    name: the-crossing
+    runtime: python
+    plan: starter
+    region: oregon
+    healthCheckPath: /healthz
+    buildCommand: pip install -r requirements.txt
+    startCommand: alembic upgrade head && uvicorn crossing.api:app --host 0.0.0.0 --port $PORT --timeout-graceful-shutdown 30
+    envVars:
+      - key: PYTHONPATH
+        value: "."
+      - key: CROSSING_FEE_BPS
+        value: "0"
+      - key: STRIPE_METER_EVENT
+        value: crossing_usage
+      - key: DATABASE_URL
+        fromDatabase:
+          name: crossing-pg
+          property: connectionString
+      - key: STRIPE_SECRET_KEY
+        sync: false
+      - key: STRIPE_WEBHOOK_SECRET
+        sync: false
+      - key: STRIPE_PRICE_ID
+        sync: false
+      - key: CROSSING_ED25519_SEED
+        sync: false
+      - key: CROSSING_KEY_PEPPER
+        sync: false
+  - type: worker
+    name: the-crossing-worker
+    runtime: python
+    plan: starter
+    region: oregon
+    buildCommand: pip install -r requirements.txt
+    startCommand: python -m crossing.worker
+    envVars:
+      - key: PYTHONPATH
+        value: "."
+      - key: CROSSING_FEE_BPS
+        value: "0"
+      - key: STRIPE_METER_EVENT
+        value: crossing_usage
+      - key: DATABASE_URL
+        fromDatabase:
+          name: crossing-pg
+          property: connectionString
+      - key: STRIPE_SECRET_KEY
+        sync: false
+      - key: STRIPE_WEBHOOK_SECRET
+        sync: false
+      - key: STRIPE_PRICE_ID
+        sync: false
+      - key: CROSSING_ED25519_SEED
+        sync: false
+      - key: CROSSING_KEY_PEPPER
+        sync: false
+
+databases:
+  - name: crossing-pg
+    plan: basic-256mb
+    postgresMajorVersion: 16
+    databaseName: crossing
+    user: crossing
