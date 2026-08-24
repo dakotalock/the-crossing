@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import hashlib
 import json
+import os
 from typing import Any
 
 from sqlalchemy.orm import Session
@@ -13,6 +15,14 @@ def _dumps(obj: Any) -> str:
     return json.dumps(obj, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
 
 
+def payload_hash(obj: Any) -> str:
+    return hashlib.sha256(crypto.canonical_dumps(obj)).hexdigest()
+
+
+def retain_payloads() -> bool:
+    return os.environ.get("CROSSING_RETAIN_PAYLOADS", "") == "1"
+
+
 def issue(
     session: Session,
     *,
@@ -23,25 +33,38 @@ def issue(
     server: str,
     amount_cents: int,
     result: Any,
+    agent_id: str | None = None,
+    task_id: str | None = None,
+    request_hash: str | None = None,
+    outcome: str = "ok",
 ) -> Receipt:
     rid = new_id()
-    body = {
+    req_hash = request_hash or payload_hash({"mandate_id": mandate_id, "server": server, "tool": tool})
+    resp_hash = payload_hash(result)
+    body: dict[str, Any] = {
         "v": 1,
         "id": rid,
-        "principal_id": principal_id,
+        "agent_id": agent_id,
+        "task_id": task_id,
         "mandate_id": mandate_id,
-        "reservation_id": reservation_id,
         "tool": tool,
         "server": server,
         "amount_cents": amount_cents,
-        "result": result,
+        "outcome": outcome,
+        "reservation_id": reservation_id,
+        "request_hash": req_hash,
+        "response_hash": resp_hash,
         "issued_at": utcnow().isoformat(),
     }
+    if retain_payloads():
+        body["result"] = result
     sig = crypto.sign_obj(body)
     rec = Receipt(
         id=rid,
         principal_id=principal_id,
         mandate_id=mandate_id,
+        agent_id=agent_id,
+        task_id=task_id,
         reservation_id=reservation_id,
         tool=tool,
         server=server,
@@ -68,6 +91,8 @@ def to_dict(receipt: Receipt) -> dict[str, Any]:
         "id": receipt.id,
         "principal_id": receipt.principal_id,
         "mandate_id": receipt.mandate_id,
+        "agent_id": receipt.agent_id,
+        "task_id": receipt.task_id,
         "reservation_id": receipt.reservation_id,
         "tool": receipt.tool,
         "server": receipt.server,

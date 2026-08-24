@@ -28,9 +28,9 @@ class Crossing:
         os.environ.setdefault("CROSSING_ALLOW_DEV", "1")
         return cls(database_url=database_url)
 
-    def create_principal(self, name: str) -> Principal:
+    def create_principal(self, name: str, pubkey_hex: str | None = None) -> Principal:
         with db.session_scope() as s:
-            return create_principal(s, name)
+            return create_principal(s, name, pubkey_hex=pubkey_hex)
 
     def create_agent(self, principal_id: str, name: str, parent_id: str | None = None) -> Agent:
         with db.session_scope() as s:
