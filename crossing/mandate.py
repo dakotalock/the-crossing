@@ -258,3 +258,12 @@ def load_live_mandate(session: Session, mandate_id: str, *, verify: bool = True)
     check_fresh(m)
     require_live_agent(session, m.agent_id)
     return m
+
+
+def revoke_mandate(session: Session, mandate_id: str) -> Mandate:
+    m = session.get(Mandate, mandate_id)
+    if m is None:
+        raise PolicyDenied(Reason.MANDATE_REVOKED, "mandate missing")
+    m.revoked = True
+    session.flush()
+    return m
