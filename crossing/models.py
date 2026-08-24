@@ -39,6 +39,12 @@ class Account(Base):
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     name: Mapped[str] = mapped_column(String(200))
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    stripe_customer_id: Mapped[str | None] = mapped_column(String(80), nullable=True, index=True)
+    stripe_subscription_id: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    stripe_price_id: Mapped[str | None] = mapped_column(String(80), nullable=True)
+    stripe_status: Mapped[str | None] = mapped_column(String(40), nullable=True)
+    fee_microcents: Mapped[int] = mapped_column(Integer, default=0)
+    fee_invoiced_cents: Mapped[int] = mapped_column(Integer, default=0)
 
     principals: Mapped[list[Principal]] = relationship(back_populates="account")
     api_keys: Mapped[list[ApiKey]] = relationship(back_populates="account")
@@ -187,15 +193,18 @@ class Outbox(Base):
     """billing_outbox: pending Stripe (or noop) work. Never HTTP inside the ledger txn."""
 
     __tablename__ = "billing_outbox"
+    __table_args__ = (UniqueConstraint("receipt_id", name="uq_outbox_receipt_id"),)
 
     id: Mapped[str] = mapped_column(String(36), primary_key=True, default=new_id)
     kind: Mapped[str] = mapped_column(String(40), default="stripe_meter")
     payload_json: Mapped[str] = mapped_column(Text)
-    status: Mapped[str] = mapped_column(String(20), default="pending")  # pending|sent|failed|noop
+    status: Mapped[str] = mapped_column(String(20), default="pending")  # pending|sending|sent|failed|noop|dead
     attempts: Mapped[int] = mapped_column(Integer, default=0)
     next_attempt_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
     last_error: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
+    receipt_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    claimed_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class IdempotencyRecord(Base):
@@ -265,6 +274,17 @@ class ApiKey(Base):
     kind: Mapped[str] = mapped_column(String(20), default="customer")  # customer|admin
 
     account: Mapped[Account] = relationship(back_populates="api_keys")
+
+
+class StripeEvent(Base):
+    """Processed Stripe webhook ids. PK uniqueness makes replay a no-op."""
+
+    __tablename__ = "stripe_events"
+
+    event_id: Mapped[str] = mapped_column(String(80), primary_key=True)
+    type: Mapped[str] = mapped_column(String(80), default="")
+    account_id: Mapped[str | None] = mapped_column(String(36), nullable=True, index=True)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), default=utcnow)
 
 
 class ReconciliationEvent(Base):
